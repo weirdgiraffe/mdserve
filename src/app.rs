@@ -1486,4 +1486,75 @@ mod tests {
         )
         .await;
     }
+
+    #[tokio::test]
+    async fn test_watch_same_dir_shares_one_watch() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "# A").unwrap();
+        fs::write(dir.path().join("b.md"), "# B").unwrap();
+        let (addr, state) = spawn_test_server(dir.path()).await;
+
+        let (_, c_a) = connect_sse(addr, "a.md").await;
+        let (_, _c_b) = connect_sse(addr, "b.md").await;
+        // Two open files under one dir -> a single watched dir, refcount 2.
+        wait_for(
+            &state,
+            |i| i.open_files.len() == 2 && i.watched_dirs.len() == 1,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(
+            *state
+                .inner
+                .lock()
+                .unwrap()
+                .watched_dirs
+                .values()
+                .next()
+                .unwrap(),
+            2
+        );
+
+        // Closing one leaves the dir watched for its sibling.
+        drop(c_a);
+        wait_for(
+            &state,
+            |i| !i.open_files.contains_key("a.md") && i.watched_dirs.len() == 1,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(
+            *state
+                .inner
+                .lock()
+                .unwrap()
+                .watched_dirs
+                .values()
+                .next()
+                .unwrap(),
+            1
+        );
+    }
+
+    // -- reserved /__mdserve/ prefix --------------------------------------
+
+    #[tokio::test]
+    async fn test_mdserve_prefix_wins_but_other_subpaths_browse() {
+        let dir = tempdir().unwrap();
+        // A directory literally named __mdserve, with content under it.
+        fs::create_dir(dir.path().join("__mdserve")).unwrap();
+        fs::write(dir.path().join("__mdserve/note.md"), "# Note").unwrap();
+        let (router, _s) = new_router(dir.path().to_path_buf()).unwrap();
+        let server = TestServer::new(router).unwrap();
+
+        // The two reserved exact routes win over content.
+        assert_eq!(
+            server.get("/__mdserve/mermaid.min.js").await.status_code(),
+            200
+        );
+        // Any other path under the prefix is plain content.
+        let note = server.get("/__mdserve/note.md").await;
+        assert_eq!(note.status_code(), 200);
+        assert!(note.text().contains("<h1>Note</h1>"));
+    }
 }
