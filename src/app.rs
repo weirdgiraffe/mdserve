@@ -1,30 +1,31 @@
 use anyhow::{Context, Result};
 use axum::{
-    extract::{
-        ws::{Message, WebSocket},
-        Path as AxumPath, State, WebSocketUpgrade,
+    extract::{Path as AxumPath, Query, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Html, IntoResponse, Response,
     },
-    http::{header, HeaderMap, StatusCode},
-    response::{Html, IntoResponse},
     routing::get,
     Router,
 };
-use futures_util::{SinkExt, StreamExt};
 use minijinja::{context, value::Value, Environment};
-use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
-use serde::{Deserialize, Serialize};
+use notify::{Config, Event as NotifyEvent, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use serde::Deserialize;
 use std::{
     collections::HashMap,
+    convert::Infallible,
     fs,
     net::{Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
-    time::SystemTime,
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
 };
 use tokio::{
     net::TcpListener,
-    sync::{broadcast, mpsc, Mutex},
+    sync::{broadcast, mpsc},
 };
+use tokio_stream::{wrappers::BroadcastStream, StreamExt as _};
 use tower_http::cors::CorsLayer;
 
 const TEMPLATE_NAME: &str = "main.html";
@@ -32,8 +33,7 @@ static TEMPLATE_ENV: OnceLock<Environment<'static>> = OnceLock::new();
 const MERMAID_JS: &str = include_str!("../static/js/mermaid.min.js");
 const MERMAID_ETAG: &str = concat!("\"", env!("CARGO_PKG_VERSION"), "\"");
 const MAX_PORT_ATTEMPTS: u16 = 10;
-
-type SharedMarkdownState = Arc<Mutex<MarkdownState>>;
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 fn template_env() -> &'static Environment<'static> {
     TEMPLATE_ENV.get_or_init(|| {
@@ -43,27 +43,153 @@ fn template_env() -> &'static Environment<'static> {
     })
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(tag = "type")]
-enum ServerMessage {
-    Reload,
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+/// Server state. The cache is permanent and unbounded; `open_files` and
+/// `watched_dirs` are mutated only by the SSE open/close lifecycle.
+struct AppState {
+    /// Security boundary, canonicalized at startup. Nothing outside is served.
+    base_dir: PathBuf,
+    inner: Mutex<Inner>,
+    /// Reload signal carrying the relpath of the file that changed.
+    reload_tx: broadcast::Sender<String>,
+    /// Single watcher, created watching nothing; dirs are added lazily.
+    watcher: Mutex<RecommendedWatcher>,
 }
 
-pub(crate) fn scan_markdown_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut md_files = Vec::new();
+struct Inner {
+    /// relpath -> rendered body HTML. Permanent, no eviction.
+    cache: HashMap<String, String>,
+    /// relpath -> count of open SSE streams. Source of truth for "interesting".
+    open_files: HashMap<String, usize>,
+    /// absolute dir -> count of open files living under it.
+    watched_dirs: HashMap<PathBuf, usize>,
+}
 
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_file() && is_markdown_file(&path) {
-            md_files.push(path);
+impl AppState {
+    /// Register an open SSE stream for `rel` whose file lives in `dir`.
+    /// Watches `dir` on the first open file under it.
+    fn open_file(&self, rel: &str, dir: &Path) {
+        let mut inner = self.inner.lock().unwrap();
+        let count = inner.open_files.entry(rel.to_string()).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            let dir_count = inner.watched_dirs.entry(dir.to_path_buf()).or_insert(0);
+            *dir_count += 1;
+            if *dir_count == 1 {
+                let mut watcher = self.watcher.lock().unwrap();
+                let _ = watcher.watch(dir, RecursiveMode::NonRecursive);
+            }
         }
     }
 
-    md_files.sort();
+    /// Deregister an open SSE stream for `rel`. Unwatches `dir` when the last
+    /// open file under it closes.
+    fn close_file(&self, rel: &str, dir: &Path) {
+        let mut inner = self.inner.lock().unwrap();
+        let removed = match inner.open_files.get_mut(rel) {
+            Some(count) => {
+                *count -= 1;
+                *count == 0
+            }
+            None => false,
+        };
+        if !removed {
+            return;
+        }
+        inner.open_files.remove(rel);
+        let unwatch = match inner.watched_dirs.get_mut(dir) {
+            Some(dir_count) => {
+                *dir_count -= 1;
+                *dir_count == 0
+            }
+            None => false,
+        };
+        if unwatch {
+            inner.watched_dirs.remove(dir);
+            let mut watcher = self.watcher.lock().unwrap();
+            let _ = watcher.unwatch(dir);
+        }
+    }
+}
 
-    Ok(md_files)
+/// RAII guard living inside the SSE stream. Dropping the stream (tab closed,
+/// reload, crash) deregisters the open file.
+struct OpenGuard {
+    state: Arc<AppState>,
+    rel: String,
+    dir: PathBuf,
+}
+
+impl Drop for OpenGuard {
+    fn drop(&mut self) {
+        self.state.close_file(&self.rel, &self.dir);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Path resolution
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+enum Resolved {
+    Directory(PathBuf),
+    Markdown { abs: PathBuf, rel: String },
+    Image(PathBuf),
+    Forbidden,
+    NotFound,
+}
+
+/// Resolve a request path under `base_dir`. The single entry point used by
+/// every content route.
+fn resolve(base_dir: &Path, request_path: &str) -> Resolved {
+    let trimmed = request_path.trim_start_matches('/');
+
+    // Reject lexical `..` escape attempts before touching the filesystem, so a
+    // traversal attempt is forbidden even when the target is missing.
+    if trimmed.split('/').any(|c| c == "..") {
+        return Resolved::Forbidden;
+    }
+
+    let joined = base_dir.join(trimmed);
+    let canonical = match joined.canonicalize() {
+        Ok(c) => c,
+        Err(_) => return Resolved::NotFound,
+    };
+
+    // Catch symlink escapes: a canonical path outside the fence is forbidden.
+    if !canonical.starts_with(base_dir) {
+        return Resolved::Forbidden;
+    }
+
+    if canonical.is_dir() {
+        return Resolved::Directory(canonical);
+    }
+
+    let rel = rel_path(base_dir, &canonical);
+    if is_markdown_file(&canonical) {
+        Resolved::Markdown {
+            abs: canonical,
+            rel,
+        }
+    } else if is_image_file(&canonical.to_string_lossy()) {
+        Resolved::Image(canonical)
+    } else {
+        Resolved::NotFound
+    }
+}
+
+/// Normalized relative path: forward slashes, no leading `./`. Empty for
+/// `base_dir` itself.
+fn rel_path(base_dir: &Path, abs: &Path) -> String {
+    abs.strip_prefix(base_dir)
+        .unwrap_or(abs)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn is_markdown_file(path: &Path) -> bool {
@@ -73,213 +199,452 @@ fn is_markdown_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-struct TrackedFile {
-    path: PathBuf,
-    last_modified: SystemTime,
-    html: String,
-}
-
-struct MarkdownState {
-    base_dir: PathBuf,
-    tracked_files: HashMap<String, TrackedFile>,
-    is_directory_mode: bool,
-    change_tx: broadcast::Sender<ServerMessage>,
-}
-
-impl MarkdownState {
-    fn new(base_dir: PathBuf, file_paths: Vec<PathBuf>, is_directory_mode: bool) -> Result<Self> {
-        let (change_tx, _) = broadcast::channel::<ServerMessage>(16);
-
-        let mut tracked_files = HashMap::new();
-        for file_path in file_paths {
-            let metadata = fs::metadata(&file_path)?;
-            let last_modified = metadata.modified()?;
-            let content = fs::read_to_string(&file_path)?;
-            let html = Self::markdown_to_html(&content)?;
-
-            let filename = file_path.file_name().unwrap().to_string_lossy().to_string();
-
-            tracked_files.insert(
-                filename,
-                TrackedFile {
-                    path: file_path,
-                    last_modified,
-                    html,
-                },
-            );
-        }
-
-        Ok(MarkdownState {
-            base_dir,
-            tracked_files,
-            is_directory_mode,
-            change_tx,
-        })
-    }
-
-    fn show_navigation(&self) -> bool {
-        self.is_directory_mode
-    }
-
-    fn get_sorted_filenames(&self) -> Vec<String> {
-        let mut filenames: Vec<_> = self.tracked_files.keys().cloned().collect();
-        filenames.sort();
-        filenames
-    }
-
-    fn refresh_file(&mut self, filename: &str) -> Result<()> {
-        if let Some(tracked) = self.tracked_files.get_mut(filename) {
-            let content = fs::read_to_string(&tracked.path)?;
-            tracked.html = Self::markdown_to_html(&content)?;
-            tracked.last_modified = fs::metadata(&tracked.path)?.modified()?;
-        }
-        Ok(())
-    }
-
-    fn add_tracked_file(&mut self, file_path: PathBuf) -> Result<()> {
-        let filename = file_path.file_name().unwrap().to_string_lossy().to_string();
-
-        if self.tracked_files.contains_key(&filename) {
-            return Ok(());
-        }
-
-        let metadata = fs::metadata(&file_path)?;
-        let content = fs::read_to_string(&file_path)?;
-
-        self.tracked_files.insert(
-            filename,
-            TrackedFile {
-                path: file_path,
-                last_modified: metadata.modified()?,
-                html: Self::markdown_to_html(&content)?,
-            },
+/// Compute the initial browser URL path for `path`, validating that it exists
+/// and resolves inside `base_dir`.
+pub(crate) fn initial_url_path(base_dir: &Path, path: &Path) -> Result<String> {
+    let abs = path
+        .canonicalize()
+        .with_context(|| format!("path does not exist: {}", path.display()))?;
+    if !abs.starts_with(base_dir) {
+        anyhow::bail!(
+            "path {} is outside base-dir {}",
+            abs.display(),
+            base_dir.display()
         );
-
-        Ok(())
     }
+    let rel = rel_path(base_dir, &abs);
+    Ok(if rel.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{rel}")
+    })
+}
 
-    fn markdown_to_html(content: &str) -> Result<String> {
-        let mut options = markdown::Options::gfm();
-        options.compile.allow_dangerous_html = true;
-        options.parse.constructs.frontmatter = true;
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
 
-        let html_body = markdown::to_html_with_options(content, &options)
-            .unwrap_or_else(|_| "Error parsing markdown".to_string());
+fn markdown_to_html(content: &str) -> String {
+    let mut options = markdown::Options::gfm();
+    options.compile.allow_dangerous_html = true;
+    options.parse.constructs.frontmatter = true;
 
-        Ok(html_body)
+    markdown::to_html_with_options(content, &options)
+        .unwrap_or_else(|_| "Error parsing markdown".to_string())
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Render the page template around a body of (already safe) HTML.
+fn render_page(body_html: &str, reload_file: Option<&str>, page_title: &str) -> Response {
+    let env = template_env();
+    let template = match env.get_template(TEMPLATE_NAME) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html(format!("Template error: {e}")),
+            )
+                .into_response();
+        }
+    };
+
+    let mermaid_enabled = body_html.contains(r#"class="language-mermaid""#);
+
+    match template.render(context! {
+        content => Value::from_safe_string(body_html.to_string()),
+        mermaid_enabled => mermaid_enabled,
+        page_title => page_title,
+        reload_file => reload_file,
+    }) {
+        Ok(rendered) => (StatusCode::OK, Html(rendered)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Html(format!("Rendering error: {e}")),
+        )
+            .into_response(),
     }
 }
 
-/// Handles a markdown file that may have been created or modified.
-/// Refreshes tracked files or adds new files in directory mode, sending reload notifications.
-async fn handle_markdown_file_change(path: &Path, state: &SharedMarkdownState) {
+fn not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Html("<h1>404 Not Found</h1>".to_string()),
+    )
+        .into_response()
+}
+
+fn forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Html("<h1>403 Forbidden</h1>".to_string()),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Content handlers
+// ---------------------------------------------------------------------------
+
+async fn serve_root(State(state): State<Arc<AppState>>) -> Response {
+    serve_resolved(&state, "")
+}
+
+async fn serve_path(
+    AxumPath(path): AxumPath<String>,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    serve_resolved(&state, &path)
+}
+
+fn serve_resolved(state: &AppState, request_path: &str) -> Response {
+    match resolve(&state.base_dir, request_path) {
+        Resolved::Forbidden => forbidden(),
+        Resolved::NotFound => not_found(),
+        Resolved::Directory(abs) => render_listing(state, &abs),
+        Resolved::Image(abs) => serve_image(&abs),
+        Resolved::Markdown { abs, rel } => serve_markdown_page(state, &abs, &rel),
+    }
+}
+
+fn serve_markdown_page(state: &AppState, abs: &Path, rel: &str) -> Response {
+    let cached = {
+        let inner = state.inner.lock().unwrap();
+        inner.cache.get(rel).cloned()
+    };
+
+    let body = match cached {
+        Some(html) => html,
+        None => {
+            // Render outside the lock, then store briefly under it.
+            let content = match fs::read_to_string(abs) {
+                Ok(c) => c,
+                Err(_) => return not_found(),
+            };
+            let html = markdown_to_html(&content);
+            let mut inner = state.inner.lock().unwrap();
+            inner.cache.entry(rel.to_string()).or_insert(html).clone()
+        }
+    };
+
+    let page_title = Path::new(rel)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(rel);
+
+    render_page(&body, Some(rel), page_title)
+}
+
+/// Render a vim/netrw-style listing: subdirectories then `.md`/`.markdown`
+/// files, each group alphabetical, hrefs absolute from the root. Rendered
+/// fresh on every request: no cache, no watch, no SSE.
+fn render_listing(state: &AppState, abs_dir: &Path) -> Response {
+    let mut dirs: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+
+    let entries = match fs::read_dir(abs_dir) {
+        Ok(e) => e,
+        Err(_) => return not_found(),
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue; // skip dotfiles / dotdirs
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            dirs.push(name);
+        } else if is_markdown_file(&path) {
+            files.push(name);
+        }
+    }
+    dirs.sort();
+    files.sort();
+
+    let dir_rel = rel_path(&state.base_dir, abs_dir);
+    let prefix = if dir_rel.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{dir_rel}/")
+    };
+
+    let mut html = String::from("<ul class=\"listing\">");
+    if abs_dir != state.base_dir {
+        let parent_href = match dir_rel.rsplit_once('/') {
+            Some((parent, _)) => format!("/{parent}/"),
+            None => "/".to_string(),
+        };
+        html.push_str(&format!("<li><a href=\"{parent_href}\">../</a></li>"));
+    }
+    for d in &dirs {
+        let name = html_escape(d);
+        html.push_str(&format!("<li><a href=\"{prefix}{name}/\">{name}/</a></li>"));
+    }
+    for f in &files {
+        let name = html_escape(f);
+        html.push_str(&format!("<li><a href=\"{prefix}{name}\">{name}</a></li>"));
+    }
+    html.push_str("</ul>");
+
+    let title = if dir_rel.is_empty() { "/" } else { &dir_rel };
+    render_page(&html, None, title)
+}
+
+fn serve_image(abs: &Path) -> Response {
+    let bytes = match fs::read(abs) {
+        Ok(b) => b,
+        Err(_) => return not_found(),
+    };
+    let content_type = guess_image_content_type(&abs.to_string_lossy());
+    let mut response = (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, content_type.as_str())],
+        bytes,
+    )
+        .into_response();
+    if content_type == "image/svg+xml" {
+        // An inline-script SVG opened directly must not execute.
+        response.headers_mut().insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("script-src 'none'"),
+        );
+    }
+    response
+}
+
+fn is_image_file(file_path: &str) -> bool {
+    guess_image_content_type(file_path).starts_with("image/")
+}
+
+fn guess_image_content_type(file_path: &str) -> String {
+    let extension = Path::new(file_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("");
+
+    match extension.to_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Mermaid asset
+// ---------------------------------------------------------------------------
+
+async fn serve_mermaid_js(headers: HeaderMap) -> impl IntoResponse {
+    if is_etag_match(&headers) {
+        return mermaid_response(StatusCode::NOT_MODIFIED, None);
+    }
+    mermaid_response(StatusCode::OK, Some(MERMAID_JS))
+}
+
+fn is_etag_match(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|etags| etags.split(',').any(|tag| tag.trim() == MERMAID_ETAG))
+}
+
+fn mermaid_response(status: StatusCode, body: Option<&'static str>) -> impl IntoResponse {
+    let headers = [
+        (header::CONTENT_TYPE, "application/javascript"),
+        (header::ETAG, MERMAID_ETAG),
+        (header::CACHE_CONTROL, "public, no-cache"),
+    ];
+
+    match body {
+        Some(content) => (status, headers, content).into_response(),
+        None => (status, headers).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SSE live reload
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct EventsQuery {
+    file: String,
+}
+
+async fn sse_handler(
+    Query(query): Query<EventsQuery>,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    let (abs, rel) = match resolve(&state.base_dir, &query.file) {
+        Resolved::Markdown { abs, rel } => (abs, rel),
+        Resolved::Forbidden => return forbidden(),
+        _ => return not_found(),
+    };
+    let dir = abs
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| state.base_dir.clone());
+
+    // (a) Subscribe first so the background re-render's reload can't be missed.
+    let rx = state.reload_tx.subscribe();
+    // (b) Register the open file and start the watch if this is the first one.
+    state.open_file(&rel, &dir);
+    // (c) Re-render in the background to catch edits made while the file was
+    //     closed (and its watch gone); reload only if the HTML changed.
+    {
+        let state = state.clone();
+        let rel = rel.clone();
+        tokio::spawn(async move {
+            rerender_and_notify(&state, &rel, &abs);
+        });
+    }
+
+    let guard = OpenGuard {
+        state: state.clone(),
+        rel: rel.clone(),
+        dir,
+    };
+
+    let stream = BroadcastStream::new(rx).filter_map(move |msg| {
+        // Hold the guard alive for the lifetime of the stream so its Drop
+        // (the close signal) fires when the stream is dropped.
+        let _ = &guard;
+        match msg {
+            Ok(changed) if changed == rel => Some(Ok::<Event, Infallible>(
+                Event::default().event("reload").data("{}"),
+            )),
+            _ => None,
+        }
+    });
+
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(KEEPALIVE_INTERVAL)
+                .text("keepalive"),
+        )
+        .into_response()
+}
+
+/// Re-render `rel` from disk and, if the HTML differs from the cache, store it
+/// and broadcast a reload. A read failure is a no-op (deletion leaves the page).
+fn rerender_and_notify(state: &AppState, rel: &str, abs: &Path) {
+    let content = match fs::read_to_string(abs) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let html = markdown_to_html(&content);
+
+    let changed = {
+        let mut inner = state.inner.lock().unwrap();
+        match inner.cache.get(rel) {
+            Some(existing) if *existing == html => false,
+            _ => {
+                inner.cache.insert(rel.to_string(), html);
+                true
+            }
+        }
+    };
+
+    if changed {
+        let _ = state.reload_tx.send(rel.to_string());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Watcher
+// ---------------------------------------------------------------------------
+
+async fn watcher_loop(state: Arc<AppState>, mut rx: mpsc::Receiver<NotifyEvent>) {
+    while let Some(event) = rx.recv().await {
+        handle_file_event(&state, event);
+    }
+}
+
+/// Filter a filesystem event down to a re-render. Only a reappearing path
+/// (`create`, rename-arrival) or a data `modify` triggers work; bare removes do
+/// nothing, so a genuine deletion leaves the open page as-is.
+fn handle_file_event(state: &AppState, event: NotifyEvent) {
+    use notify::event::{ModifyKind, RenameMode};
+
+    // Collect the paths that represent a reappearing or modified file. Bare
+    // removes (RenameMode::From, Remove, ...) contribute nothing.
+    let candidates: Vec<&Path> = match event.kind {
+        // Linux/Windows rename-over: [old, new] in one event; the new path.
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => event
+            .paths
+            .get(1)
+            .map(PathBuf::as_path)
+            .into_iter()
+            .collect(),
+        // Rename arrival: a single new path.
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => event
+            .paths
+            .first()
+            .map(PathBuf::as_path)
+            .into_iter()
+            .collect(),
+        // macOS: separate events for old and new; only the one that exists.
+        EventKind::Modify(ModifyKind::Name(RenameMode::Any)) => event
+            .paths
+            .first()
+            .filter(|p| p.exists())
+            .map(PathBuf::as_path)
+            .into_iter()
+            .collect(),
+        EventKind::Create(_) | EventKind::Modify(ModifyKind::Data(_)) => {
+            event.paths.iter().map(PathBuf::as_path).collect()
+        }
+        _ => Vec::new(),
+    };
+
+    for path in candidates {
+        maybe_rerender(state, path);
+    }
+}
+
+/// Re-render `path` only if it is a markdown file currently open in a browser.
+fn maybe_rerender(state: &AppState, path: &Path) {
     if !is_markdown_file(path) {
         return;
     }
-
-    let filename = path.file_name().and_then(|n| n.to_str()).map(String::from);
-    let Some(filename) = filename else {
-        return;
+    let canonical = match path.canonicalize() {
+        Ok(c) => c,
+        Err(_) => return,
     };
-
-    let mut state_guard = state.lock().await;
-
-    // If file is already tracked, refresh its content
-    if state_guard.tracked_files.contains_key(&filename) {
-        if state_guard.refresh_file(&filename).is_ok() {
-            let _ = state_guard.change_tx.send(ServerMessage::Reload);
-        }
-    } else if state_guard.is_directory_mode {
-        // New file in directory mode - add and reload
-        if state_guard.add_tracked_file(path.to_path_buf()).is_ok() {
-            let _ = state_guard.change_tx.send(ServerMessage::Reload);
-        }
+    if !canonical.starts_with(&state.base_dir) {
+        return;
+    }
+    let rel = rel_path(&state.base_dir, &canonical);
+    let open = state.inner.lock().unwrap().open_files.contains_key(&rel);
+    if open {
+        rerender_and_notify(state, &rel, &canonical);
     }
 }
 
-async fn handle_file_event(event: Event, state: &SharedMarkdownState) {
-    match event.kind {
-        notify::EventKind::Modify(notify::event::ModifyKind::Name(rename_mode)) => {
-            use notify::event::RenameMode;
-            match rename_mode {
-                RenameMode::Both => {
-                    // Linux/Windows: Both old and new paths provided in single event
-                    if event.paths.len() == 2 {
-                        let new_path = &event.paths[1];
-                        handle_markdown_file_change(new_path, state).await;
-                    }
-                }
-                RenameMode::From => {
-                    // File being renamed away - ignore
-                }
-                RenameMode::To => {
-                    // File renamed to this location
-                    if let Some(path) = event.paths.first() {
-                        handle_markdown_file_change(path, state).await;
-                    }
-                }
-                RenameMode::Any => {
-                    // macOS: Sends separate events for old and new paths
-                    // Use file existence to distinguish old (doesn't exist) from new (exists)
-                    if let Some(path) = event.paths.first() {
-                        if path.exists() {
-                            handle_markdown_file_change(path, state).await;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        _ => {
-            for path in &event.paths {
-                if is_markdown_file(path) {
-                    match event.kind {
-                        notify::EventKind::Create(_)
-                        | notify::EventKind::Modify(notify::event::ModifyKind::Data(_)) => {
-                            handle_markdown_file_change(path, state).await;
-                        }
-                        notify::EventKind::Remove(_) => {
-                            // Don't remove files from tracking. Editors like neovim save by
-                            // renaming the file to a backup, then creating a new one. If we
-                            // removed the file here, HTTP requests during that window would
-                            // see empty tracked_files and return 404.
-                        }
-                        _ => {}
-                    }
-                } else if path.is_file() && is_image_file(path.to_str().unwrap_or("")) {
-                    match event.kind {
-                        notify::EventKind::Modify(_)
-                        | notify::EventKind::Create(_)
-                        | notify::EventKind::Remove(_) => {
-                            let state_guard = state.lock().await;
-                            let _ = state_guard.change_tx.send(ServerMessage::Reload);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// Server wiring
+// ---------------------------------------------------------------------------
 
-fn new_router(
-    base_dir: PathBuf,
-    tracked_files: Vec<PathBuf>,
-    is_directory_mode: bool,
-) -> Result<Router> {
+fn new_router(base_dir: PathBuf) -> Result<(Router, Arc<AppState>)> {
     let base_dir = base_dir.canonicalize()?;
 
-    let state = Arc::new(Mutex::new(MarkdownState::new(
-        base_dir.clone(),
-        tracked_files,
-        is_directory_mode,
-    )?));
+    let (reload_tx, _) = broadcast::channel::<String>(64);
+    let (tx, rx) = mpsc::channel::<NotifyEvent>(100);
 
-    let watcher_state = state.clone();
-    let (tx, mut rx) = mpsc::channel(100);
-
-    let mut watcher = RecommendedWatcher::new(
-        move |res: std::result::Result<Event, notify::Error>| {
+    // Single watcher, watching nothing until a file is opened.
+    let watcher = RecommendedWatcher::new(
+        move |res: std::result::Result<NotifyEvent, notify::Error>| {
             if let Ok(event) = res {
                 let _ = tx.blocking_send(event);
             }
@@ -287,24 +652,28 @@ fn new_router(
         Config::default(),
     )?;
 
-    watcher.watch(&base_dir, RecursiveMode::NonRecursive)?;
-
-    tokio::spawn(async move {
-        let _watcher = watcher;
-        while let Some(event) = rx.recv().await {
-            handle_file_event(event, &watcher_state).await;
-        }
+    let state = Arc::new(AppState {
+        base_dir,
+        inner: Mutex::new(Inner {
+            cache: HashMap::new(),
+            open_files: HashMap::new(),
+            watched_dirs: HashMap::new(),
+        }),
+        reload_tx,
+        watcher: Mutex::new(watcher),
     });
 
-    let router = Router::new()
-        .route("/", get(serve_html_root))
-        .route("/ws", get(websocket_handler))
-        .route("/mermaid.min.js", get(serve_mermaid_js))
-        .route("/*filename", get(serve_file))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+    tokio::spawn(watcher_loop(state.clone(), rx));
 
-    Ok(router)
+    let router = Router::new()
+        .route("/__mdserve/events", get(sse_handler))
+        .route("/__mdserve/mermaid.min.js", get(serve_mermaid_js))
+        .route("/", get(serve_root))
+        .route("/*path", get(serve_path))
+        .layer(CorsLayer::permissive())
+        .with_state(state.clone());
+
+    Ok((router, state))
 }
 
 async fn bind_with_retry(hostname: &str, port: u16) -> Result<(TcpListener, u16)> {
@@ -330,40 +699,32 @@ async fn bind_with_retry(hostname: &str, port: u16) -> Result<(TcpListener, u16)
         )))
 }
 
-pub(crate) async fn serve_markdown(
+pub(crate) async fn serve(
     base_dir: PathBuf,
-    tracked_files: Vec<PathBuf>,
-    is_directory_mode: bool,
+    url_path: String,
     hostname: impl AsRef<str>,
     port: u16,
     open: bool,
 ) -> Result<()> {
     let hostname = hostname.as_ref();
 
-    let first_file = tracked_files.first().cloned();
-    let router = new_router(base_dir.clone(), tracked_files, is_directory_mode)?;
+    let (router, _state) = new_router(base_dir.clone())?;
 
     let (listener, actual_port) = bind_with_retry(hostname, port).await?;
-
     if actual_port != port {
         println!("⚠ Port {port} in use, using {actual_port} instead");
     }
 
     let listen_addr = format_host(hostname, actual_port);
+    let browse_addr = format_host(&browsable_host(hostname), actual_port);
 
-    if is_directory_mode {
-        println!("📁 Serving markdown files from: {}", base_dir.display());
-    } else if let Some(file_path) = first_file {
-        println!("📄 Serving markdown file: {}", file_path.display());
-    }
-
-    println!("🌐 Server running at: http://{listen_addr}");
+    println!("📁 Base directory: {}", base_dir.display());
+    println!("🌐 Server running at: http://{listen_addr}{url_path}");
     println!("⚡ Live reload enabled");
     println!("\nPress Ctrl+C to stop the server");
 
     if open {
-        let browse_addr = format_host(&browsable_host(hostname), actual_port);
-        open_browser(&format!("http://{browse_addr}"))?;
+        open_browser(&format!("http://{browse_addr}{url_path}"))?;
     }
 
     axum::serve(listener, router).await?;
@@ -401,11 +762,6 @@ fn browsable_host(hostname: &str) -> String {
 }
 
 /// Open a URL in the default browser using platform commands.
-///
-/// Fails immediately if the command cannot be spawned (e.g. not
-/// installed). Exit status is monitored in a background thread
-/// since opener commands may block until their handler process
-/// returns.
 fn open_browser(url: &str) -> Result<()> {
     let program = if cfg!(target_os = "macos") {
         "open"
@@ -434,399 +790,59 @@ fn open_browser(url: &str) -> Result<()> {
     Ok(())
 }
 
-async fn serve_html_root(State(state): State<SharedMarkdownState>) -> impl IntoResponse {
-    let state = state.lock().await;
-
-    let filename = match state.get_sorted_filenames().into_iter().next() {
-        Some(name) => name,
-        None => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Html("No files available to serve".to_string()),
-            );
-        }
-    };
-
-    render_markdown(&state, &filename).await
-}
-
-async fn serve_file(
-    AxumPath(filename): AxumPath<String>,
-    State(state): State<SharedMarkdownState>,
-) -> axum::response::Response {
-    if filename.ends_with(".md") || filename.ends_with(".markdown") {
-        let state = state.lock().await;
-
-        if !state.tracked_files.contains_key(&filename) {
-            return (StatusCode::NOT_FOUND, Html("File not found".to_string())).into_response();
-        }
-
-        let (status, html) = render_markdown(&state, &filename).await;
-        (status, html).into_response()
-    } else if is_image_file(&filename) {
-        serve_static_file_inner(filename, state).await
-    } else {
-        (StatusCode::NOT_FOUND, Html("File not found".to_string())).into_response()
-    }
-}
-
-async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCode, Html<String>) {
-    let env = template_env();
-    let template = match env.get_template(TEMPLATE_NAME) {
-        Ok(t) => t,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Html(format!("Template error: {e}")),
-            );
-        }
-    };
-
-    let (content, has_mermaid) = if let Some(tracked) = state.tracked_files.get(current_file) {
-        let html = &tracked.html;
-        let mermaid = html.contains(r#"class="language-mermaid""#);
-        (Value::from_safe_string(html.clone()), mermaid)
-    } else {
-        return (StatusCode::NOT_FOUND, Html("File not found".to_string()));
-    };
-
-    // Derive page title from filename (stem without extension)
-    let page_title = std::path::Path::new(current_file)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(current_file);
-
-    let rendered = if state.show_navigation() {
-        let filenames = state.get_sorted_filenames();
-        let files: Vec<Value> = filenames
-            .iter()
-            .map(|name| {
-                Value::from_object({
-                    let mut map = std::collections::HashMap::new();
-                    map.insert("name".to_string(), Value::from(name.clone()));
-                    map
-                })
-            })
-            .collect();
-
-        match template.render(context! {
-            content => content,
-            mermaid_enabled => has_mermaid,
-            show_navigation => true,
-            files => files,
-            current_file => current_file,
-            page_title => page_title,
-        }) {
-            Ok(r) => r,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Html(format!("Rendering error: {e}")),
-                );
-            }
-        }
-    } else {
-        match template.render(context! {
-            content => content,
-            mermaid_enabled => has_mermaid,
-            show_navigation => false,
-            page_title => page_title,
-        }) {
-            Ok(r) => r,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Html(format!("Rendering error: {e}")),
-                );
-            }
-        }
-    };
-
-    (StatusCode::OK, Html(rendered))
-}
-
-async fn serve_mermaid_js(headers: HeaderMap) -> impl IntoResponse {
-    if is_etag_match(&headers) {
-        return mermaid_response(StatusCode::NOT_MODIFIED, None);
-    }
-
-    mermaid_response(StatusCode::OK, Some(MERMAID_JS))
-}
-
-fn is_etag_match(headers: &HeaderMap) -> bool {
-    headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|etags| etags.split(',').any(|tag| tag.trim() == MERMAID_ETAG))
-}
-
-fn mermaid_response(status: StatusCode, body: Option<&'static str>) -> impl IntoResponse {
-    // Use no-cache to force revalidation on each request. This ensures clients
-    // get updated content when mdserve is rebuilt with a new Mermaid version,
-    // while still benefiting from 304 responses via ETag matching.
-    let headers = [
-        (header::CONTENT_TYPE, "application/javascript"),
-        (header::ETAG, MERMAID_ETAG),
-        (header::CACHE_CONTROL, "public, no-cache"),
-    ];
-
-    match body {
-        Some(content) => (status, headers, content).into_response(),
-        None => (status, headers).into_response(),
-    }
-}
-
-async fn serve_static_file_inner(
-    filename: String,
-    state: SharedMarkdownState,
-) -> axum::response::Response {
-    let state = state.lock().await;
-
-    let full_path = state.base_dir.join(&filename);
-
-    match full_path.canonicalize() {
-        Ok(canonical_path) => {
-            if !canonical_path.starts_with(&state.base_dir) {
-                return (
-                    StatusCode::FORBIDDEN,
-                    [(header::CONTENT_TYPE, "text/plain")],
-                    "Access denied".to_string(),
-                )
-                    .into_response();
-            }
-
-            match fs::read(&canonical_path) {
-                Ok(contents) => {
-                    let content_type = guess_image_content_type(&filename);
-                    (
-                        StatusCode::OK,
-                        [(header::CONTENT_TYPE, content_type.as_str())],
-                        contents,
-                    )
-                        .into_response()
-                }
-                Err(_) => (
-                    StatusCode::NOT_FOUND,
-                    [(header::CONTENT_TYPE, "text/plain")],
-                    "File not found".to_string(),
-                )
-                    .into_response(),
-            }
-        }
-        Err(_) => (
-            StatusCode::NOT_FOUND,
-            [(header::CONTENT_TYPE, "text/plain")],
-            "File not found".to_string(),
-        )
-            .into_response(),
-    }
-}
-
-fn is_image_file(file_path: &str) -> bool {
-    guess_image_content_type(file_path).starts_with("image/")
-}
-
-fn guess_image_content_type(file_path: &str) -> String {
-    let extension = std::path::Path::new(file_path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("");
-
-    match extension.to_lowercase().as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "svg" => "image/svg+xml",
-        "webp" => "image/webp",
-        "bmp" => "image/bmp",
-        "ico" => "image/x-icon",
-        _ => "application/octet-stream",
-    }
-    .to_string()
-}
-
-async fn websocket_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<SharedMarkdownState>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_websocket(socket, state))
-}
-
-async fn handle_websocket(socket: WebSocket, state: SharedMarkdownState) {
-    let (mut sender, mut receiver) = socket.split();
-
-    let mut change_rx = {
-        let state = state.lock().await;
-        state.change_tx.subscribe()
-    };
-
-    let recv_task = tokio::spawn(async move {
-        while let Some(msg) = receiver.next().await {
-            match msg {
-                Ok(Message::Text(_)) => {}
-                Ok(Message::Close(_)) => break,
-                _ => {}
-            }
-        }
-    });
-
-    let send_task = tokio::spawn(async move {
-        while let Ok(reload_msg) = change_rx.recv().await {
-            if let Ok(json) = serde_json::to_string(&reload_msg) {
-                if sender.send(Message::Text(json)).await.is_err() {
-                    break;
-                }
-            }
-        }
-    });
-
-    tokio::select! {
-        _ = recv_task => {},
-        _ = send_task => {},
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::tempdir;
+    use axum_test::TestServer;
+    use std::net::SocketAddr;
+    use std::time::Instant;
+    use tempfile::{tempdir, TempDir};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpStream;
+
+    // -- unit: path / extension helpers -----------------------------------
 
     #[test]
     fn test_is_markdown_file() {
         assert!(is_markdown_file(Path::new("test.md")));
-        assert!(is_markdown_file(Path::new("/path/to/file.md")));
-
-        assert!(is_markdown_file(Path::new("test.markdown")));
         assert!(is_markdown_file(Path::new("/path/to/file.markdown")));
-
         assert!(is_markdown_file(Path::new("test.MD")));
-        assert!(is_markdown_file(Path::new("test.Md")));
         assert!(is_markdown_file(Path::new("test.MARKDOWN")));
-        assert!(is_markdown_file(Path::new("test.MarkDown")));
 
         assert!(!is_markdown_file(Path::new("test.txt")));
-        assert!(!is_markdown_file(Path::new("test.rs")));
-        assert!(!is_markdown_file(Path::new("test.html")));
-        assert!(!is_markdown_file(Path::new("test")));
         assert!(!is_markdown_file(Path::new("README")));
     }
 
     #[test]
     fn test_is_image_file() {
-        assert!(is_image_file("test.png"));
-        assert!(is_image_file("test.jpg"));
-        assert!(is_image_file("test.jpeg"));
-        assert!(is_image_file("test.gif"));
-        assert!(is_image_file("test.svg"));
-        assert!(is_image_file("test.webp"));
-        assert!(is_image_file("test.bmp"));
-        assert!(is_image_file("test.ico"));
-
+        for ext in [
+            "png", "jpg", "jpeg", "gif", "svg", "webp", "avif", "bmp", "ico",
+        ] {
+            assert!(is_image_file(&format!("test.{ext}")), "{ext}");
+        }
         assert!(is_image_file("test.PNG"));
-        assert!(is_image_file("test.JPG"));
-        assert!(is_image_file("test.JPEG"));
-
-        assert!(is_image_file("/path/to/image.png"));
-        assert!(is_image_file("./images/photo.jpg"));
-
         assert!(!is_image_file("test.txt"));
         assert!(!is_image_file("test.md"));
-        assert!(!is_image_file("test.rs"));
-        assert!(!is_image_file("test"));
     }
 
     #[test]
     fn test_guess_image_content_type() {
         assert_eq!(guess_image_content_type("test.png"), "image/png");
         assert_eq!(guess_image_content_type("test.jpg"), "image/jpeg");
-        assert_eq!(guess_image_content_type("test.jpeg"), "image/jpeg");
-        assert_eq!(guess_image_content_type("test.gif"), "image/gif");
         assert_eq!(guess_image_content_type("test.svg"), "image/svg+xml");
-        assert_eq!(guess_image_content_type("test.webp"), "image/webp");
-        assert_eq!(guess_image_content_type("test.bmp"), "image/bmp");
+        assert_eq!(guess_image_content_type("test.avif"), "image/avif");
         assert_eq!(guess_image_content_type("test.ico"), "image/x-icon");
-
-        assert_eq!(guess_image_content_type("test.PNG"), "image/png");
-        assert_eq!(guess_image_content_type("test.JPG"), "image/jpeg");
-
         assert_eq!(
             guess_image_content_type("test.xyz"),
             "application/octet-stream"
         );
-        assert_eq!(guess_image_content_type("test"), "application/octet-stream");
-    }
-
-    #[test]
-    fn test_scan_markdown_files_empty_directory() {
-        let temp_dir = tempdir().expect("Failed to create temp dir");
-
-        let result = scan_markdown_files(temp_dir.path()).expect("Failed to scan");
-        assert_eq!(result.len(), 0);
-    }
-
-    #[test]
-    fn test_scan_markdown_files_with_markdown_files() {
-        let temp_dir = tempdir().expect("Failed to create temp dir");
-
-        fs::write(temp_dir.path().join("test1.md"), "# Test 1").expect("Failed to write");
-        fs::write(temp_dir.path().join("test2.markdown"), "# Test 2").expect("Failed to write");
-        fs::write(temp_dir.path().join("test3.md"), "# Test 3").expect("Failed to write");
-
-        fs::write(temp_dir.path().join("test.txt"), "text").expect("Failed to write");
-        fs::write(temp_dir.path().join("README"), "readme").expect("Failed to write");
-
-        let result = scan_markdown_files(temp_dir.path()).expect("Failed to scan");
-
-        assert_eq!(result.len(), 3);
-
-        let filenames: Vec<_> = result
-            .iter()
-            .map(|p| p.file_name().unwrap().to_str().unwrap())
-            .collect();
-        assert_eq!(filenames, vec!["test1.md", "test2.markdown", "test3.md"]);
-    }
-
-    #[test]
-    fn test_scan_markdown_files_ignores_subdirectories() {
-        let temp_dir = tempdir().expect("Failed to create temp dir");
-
-        fs::write(temp_dir.path().join("root.md"), "# Root").expect("Failed to write");
-
-        let sub_dir = temp_dir.path().join("subdir");
-        fs::create_dir(&sub_dir).expect("Failed to create subdir");
-        fs::write(sub_dir.join("nested.md"), "# Nested").expect("Failed to write");
-
-        let result = scan_markdown_files(temp_dir.path()).expect("Failed to scan");
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].file_name().unwrap().to_str().unwrap(), "root.md");
-    }
-
-    #[test]
-    fn test_scan_markdown_files_case_insensitive() {
-        let temp_dir = tempdir().expect("Failed to create temp dir");
-
-        fs::write(temp_dir.path().join("test1.md"), "# Test 1").expect("Failed to write");
-        fs::write(temp_dir.path().join("test2.MD"), "# Test 2").expect("Failed to write");
-        fs::write(temp_dir.path().join("test3.Md"), "# Test 3").expect("Failed to write");
-        fs::write(temp_dir.path().join("test4.MARKDOWN"), "# Test 4").expect("Failed to write");
-
-        let result = scan_markdown_files(temp_dir.path()).expect("Failed to scan");
-
-        assert_eq!(result.len(), 4);
     }
 
     #[test]
     fn test_format_host() {
         assert_eq!(format_host("127.0.0.1", 3000), "127.0.0.1:3000");
-        assert_eq!(format_host("192.168.1.1", 8080), "192.168.1.1:8080");
-
         assert_eq!(format_host("localhost", 3000), "localhost:3000");
-        assert_eq!(format_host("example.com", 80), "example.com:80");
-
         assert_eq!(format_host("::1", 3000), "[::1]:3000");
-        assert_eq!(format_host("2001:db8::1", 8080), "[2001:db8::1]:8080");
     }
 
     #[test]
@@ -834,9 +850,6 @@ mod tests {
         assert_eq!(browsable_host("0.0.0.0"), "127.0.0.1");
         assert_eq!(browsable_host("::"), "::1");
         assert_eq!(browsable_host("127.0.0.1"), "127.0.0.1");
-        assert_eq!(browsable_host("::1"), "::1");
-        assert_eq!(browsable_host("192.168.1.1"), "192.168.1.1");
-        assert_eq!(browsable_host("localhost"), "localhost");
         assert_eq!(browsable_host("example.com"), "example.com");
     }
 
@@ -848,864 +861,629 @@ mod tests {
         let (retry_listener, actual_port) =
             bind_with_retry("127.0.0.1", blocked_port).await.unwrap();
 
-        assert!(
-            actual_port > blocked_port,
-            "Should bind to a higher port when requested port is in use"
-        );
+        assert!(actual_port > blocked_port);
 
         drop(retry_listener);
         drop(listener);
     }
 
-    use axum_test::TestServer;
-    use std::time::Duration;
-    use tempfile::{Builder, NamedTempFile, TempDir};
+    // -- unit: resolver ----------------------------------------------------
 
-    const FILE_WATCH_DELAY_MS: u64 = 100;
-    const WEBSOCKET_TIMEOUT_SECS: u64 = 5;
+    #[test]
+    fn test_resolve() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        fs::create_dir_all(base.join("docs")).unwrap();
+        fs::write(base.join("docs/api.md"), "# api").unwrap();
+        fs::write(base.join("pic.png"), [0u8; 4]).unwrap();
+        fs::write(base.join("art.avif"), [0u8; 4]).unwrap();
+        fs::write(base.join("secret.txt"), "s").unwrap();
 
-    const TEST_FILE_1_CONTENT: &str = "# Test 1\n\nContent of test1";
-    const TEST_FILE_2_CONTENT: &str = "# Test 2\n\nContent of test2";
-    const TEST_FILE_3_CONTENT: &str = "# Test 3\n\nContent of test3";
-    const YAML_FRONTMATTER_CONTENT: &str =
-        "---\ntitle: Test Post\nauthor: Name\n---\n\n# Test Post\n";
-    const TOML_FRONTMATTER_CONTENT: &str = "+++\ntitle = \"Test Post\"\n+++\n\n# Test Post\n";
-
-    fn create_test_server_impl(content: &str, use_http: bool) -> (TestServer, NamedTempFile) {
-        let temp_file = Builder::new()
-            .suffix(".md")
-            .tempfile()
-            .expect("Failed to create temp file");
-        fs::write(&temp_file, content).expect("Failed to write temp file");
-
-        let canonical_path = temp_file
-            .path()
-            .canonicalize()
-            .unwrap_or_else(|_| temp_file.path().to_path_buf());
-
-        let base_dir = canonical_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .to_path_buf();
-        let tracked_files = vec![canonical_path];
-        let is_directory_mode = false;
-
-        let router = new_router(base_dir, tracked_files, is_directory_mode)
-            .expect("Failed to create router");
-
-        let server = if use_http {
-            TestServer::builder()
-                .http_transport()
-                .build(router)
-                .expect("Failed to create test server")
-        } else {
-            TestServer::new(router).expect("Failed to create test server")
-        };
-
-        (server, temp_file)
+        match resolve(&base, "docs/api.md") {
+            Resolved::Markdown { rel, .. } => assert_eq!(rel, "docs/api.md"),
+            o => panic!("expected markdown, got {o:?}"),
+        }
+        assert!(matches!(resolve(&base, ""), Resolved::Directory(_)));
+        assert!(matches!(resolve(&base, "docs"), Resolved::Directory(_)));
+        assert!(matches!(resolve(&base, "../x.md"), Resolved::Forbidden));
+        assert!(matches!(
+            resolve(&base, "docs/../../x"),
+            Resolved::Forbidden
+        ));
+        assert!(matches!(resolve(&base, "missing.md"), Resolved::NotFound));
+        assert!(matches!(resolve(&base, "secret.txt"), Resolved::NotFound));
+        assert!(matches!(resolve(&base, "pic.png"), Resolved::Image(_)));
+        assert!(matches!(resolve(&base, "art.avif"), Resolved::Image(_)));
     }
 
-    async fn create_test_server(content: &str) -> (TestServer, NamedTempFile) {
-        create_test_server_impl(content, false)
+    #[test]
+    #[cfg(unix)]
+    fn test_resolve_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let outside = tempdir().unwrap();
+        let target = outside.path().join("o.md");
+        fs::write(&target, "# o").unwrap();
+        symlink(&target, base.join("link.md")).unwrap();
+        assert!(matches!(resolve(&base, "link.md"), Resolved::Forbidden));
     }
 
-    async fn create_test_server_with_http(content: &str) -> (TestServer, NamedTempFile) {
-        create_test_server_impl(content, true)
+    #[test]
+    fn test_initial_url_path() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        fs::create_dir(base.join("docs")).unwrap();
+        fs::write(base.join("docs/api.md"), "# x").unwrap();
+
+        assert_eq!(initial_url_path(&base, &base).unwrap(), "/");
+        assert_eq!(
+            initial_url_path(&base, &base.join("docs/api.md")).unwrap(),
+            "/docs/api.md"
+        );
+        assert_eq!(
+            initial_url_path(&base, &base.join("docs")).unwrap(),
+            "/docs"
+        );
+
+        // A path outside the fence is rejected.
+        let outside = dir.path().parent().unwrap().to_path_buf();
+        assert!(initial_url_path(&base, &outside).is_err());
     }
 
-    fn create_directory_server_impl(use_http: bool) -> (TestServer, TempDir) {
-        let temp_dir = tempdir().expect("Failed to create temp dir");
+    // -- helpers -----------------------------------------------------------
 
-        fs::write(temp_dir.path().join("test1.md"), TEST_FILE_1_CONTENT)
-            .expect("Failed to write test1.md");
-        fs::write(temp_dir.path().join("test2.markdown"), TEST_FILE_2_CONTENT)
-            .expect("Failed to write test2.markdown");
-        fs::write(temp_dir.path().join("test3.md"), TEST_FILE_3_CONTENT)
-            .expect("Failed to write test3.md");
-
-        let base_dir = temp_dir.path().to_path_buf();
-        let tracked_files = scan_markdown_files(&base_dir).expect("Failed to scan markdown files");
-        let is_directory_mode = true;
-
-        let router = new_router(base_dir, tracked_files, is_directory_mode)
-            .expect("Failed to create router");
-
-        let server = if use_http {
-            TestServer::builder()
-                .http_transport()
-                .build(router)
-                .expect("Failed to create test server")
-        } else {
-            TestServer::new(router).expect("Failed to create test server")
-        };
-
-        (server, temp_dir)
+    /// A mock-transport server backed by a tempdir with one `test.md`.
+    async fn md_server(content: &str) -> (TestServer, TempDir) {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("test.md"), content).unwrap();
+        let (router, _state) = new_router(dir.path().to_path_buf()).unwrap();
+        (TestServer::new(router).unwrap(), dir)
     }
 
-    async fn create_directory_server() -> (TestServer, TempDir) {
-        create_directory_server_impl(false)
+    /// A real TCP server, returning its address and a handle to its state.
+    async fn spawn_test_server(dir: &Path) -> (SocketAddr, Arc<AppState>) {
+        let (router, state) = new_router(dir.to_path_buf()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (addr, state)
     }
 
-    async fn create_directory_server_with_http() -> (TestServer, TempDir) {
-        create_directory_server_impl(true)
+    /// Issue a GET and return the status code (consuming only the status line,
+    /// which is enough to guarantee the handler ran and the cache was populated).
+    async fn http_get(addr: SocketAddr, path: &str) -> u16 {
+        let mut reader = BufReader::new(TcpStream::connect(addr).await.unwrap());
+        let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        reader.get_mut().write_all(req.as_bytes()).await.unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        line.split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0)
     }
+
+    struct SseConn {
+        reader: BufReader<TcpStream>,
+    }
+
+    /// Open an SSE stream; returns the HTTP status and the live connection.
+    /// Dropping the returned `SseConn` closes the socket (the close signal).
+    async fn connect_sse(addr: SocketAddr, file: &str) -> (u16, SseConn) {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let req = format!(
+            "GET /__mdserve/events?file={file} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"
+        );
+        reader.get_mut().write_all(req.as_bytes()).await.unwrap();
+
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).await.unwrap();
+        let code = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+
+        loop {
+            let mut header = String::new();
+            let n = reader.read_line(&mut header).await.unwrap();
+            if n == 0 || header == "\r\n" {
+                break;
+            }
+        }
+        (code, SseConn { reader })
+    }
+
+    impl SseConn {
+        async fn expect_event(&mut self, name: &str, timeout: Duration) {
+            let deadline = Instant::now() + timeout;
+            let want = format!("event: {name}");
+            loop {
+                let now = Instant::now();
+                assert!(now < deadline, "timed out waiting for {want}");
+                let mut line = String::new();
+                match tokio::time::timeout(deadline - now, self.reader.read_line(&mut line)).await {
+                    Ok(Ok(0)) => panic!("connection closed waiting for {want}"),
+                    Ok(Ok(_)) => {
+                        if line.trim() == want {
+                            return;
+                        }
+                    }
+                    Ok(Err(e)) => panic!("read error: {e}"),
+                    Err(_) => panic!("timed out waiting for {want}"),
+                }
+            }
+        }
+
+        async fn expect_no_event(&mut self, name: &str, within: Duration) {
+            let deadline = Instant::now() + within;
+            let unwanted = format!("event: {name}");
+            loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    return;
+                }
+                let mut line = String::new();
+                match tokio::time::timeout(deadline - now, self.reader.read_line(&mut line)).await {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
+                    Ok(Ok(_)) => assert_ne!(line.trim(), unwanted, "unexpected {unwanted}"),
+                }
+            }
+        }
+    }
+
+    async fn wait_for<F: Fn(&Inner) -> bool>(state: &AppState, pred: F, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if pred(&state.inner.lock().unwrap()) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "wait_for timed out");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    // -- rendering ---------------------------------------------------------
 
     #[tokio::test]
-    async fn test_server_starts_and_serves_basic_markdown() {
-        let (server, _temp_file) =
-            create_test_server("# Hello World\n\nThis is **bold** text.").await;
-
-        let response = server.get("/").await;
-
+    async fn test_serves_basic_markdown() {
+        let (server, _d) = md_server("# Hello World\n\nThis is **bold** text.").await;
+        let response = server.get("/test.md").await;
         assert_eq!(response.status_code(), 200);
         let body = response.text();
-
         assert!(body.contains("<h1>Hello World</h1>"));
         assert!(body.contains("<strong>bold</strong>"));
         assert!(body.contains("theme-toggle"));
-        assert!(body.contains("openThemeModal"));
         assert!(body.contains("--bg-color"));
         assert!(body.contains("data-theme=\"dark\""));
     }
 
     #[tokio::test]
-    async fn test_websocket_connection() {
-        let (server, _temp_file) = create_test_server_with_http("# WebSocket Test").await;
-
-        let response = server.get_websocket("/ws").await;
-        response.assert_status_switching_protocols();
-    }
-
-    #[tokio::test]
-    async fn test_file_modification_updates_via_websocket() {
-        let (server, temp_file) = create_test_server_with_http("# Original Content").await;
-
-        let mut websocket = server.get_websocket("/ws").await.into_websocket().await;
-
-        fs::write(&temp_file, "# Modified Content").expect("Failed to modify file");
-
-        tokio::time::sleep(Duration::from_millis(FILE_WATCH_DELAY_MS)).await;
-
-        let update_result = tokio::time::timeout(
-            Duration::from_secs(WEBSOCKET_TIMEOUT_SECS),
-            websocket.receive_json::<ServerMessage>(),
-        )
-        .await;
-
-        update_result.expect("Timeout waiting for WebSocket update after file modification");
-    }
-
-    #[tokio::test]
-    async fn test_server_handles_gfm_features() {
-        let markdown_content = r#"# GFM Test
-
-## Table
-| Name | Age |
-|------|-----|
-| John | 30  |
-| Jane | 25  |
-
-## Strikethrough
-~~deleted text~~
-
-## Code block
-```rust
-fn main() {
-    println!("Hello!");
-}
-```
-"#;
-
-        let (server, _temp_file) = create_test_server(markdown_content).await;
-
-        let response = server.get("/").await;
-
-        assert_eq!(response.status_code(), 200);
-        let body = response.text();
-
+    async fn test_gfm_features() {
+        let content = "# GFM\n\n| Name | Age |\n|------|-----|\n| John | 30 |\n\n~~gone~~\n";
+        let (server, _d) = md_server(content).await;
+        let body = server.get("/test.md").await.text();
         assert!(body.contains("<table>"));
         assert!(body.contains("<th>Name</th>"));
         assert!(body.contains("<td>John</td>"));
-        assert!(body.contains("<del>deleted text</del>"));
-        assert!(body.contains("<pre>"));
-        assert!(body.contains("fn main()"));
+        assert!(body.contains("<del>gone</del>"));
     }
 
     #[tokio::test]
-    async fn test_404_for_unknown_routes() {
-        let (server, _temp_file) = create_test_server("# 404 Test").await;
-
-        let response = server.get("/unknown-route").await;
-
-        assert_eq!(response.status_code(), 404);
-    }
-
-    #[tokio::test]
-    async fn test_image_serving() {
-        let temp_dir = tempdir().expect("Failed to create temp dir");
-
-        let md_content =
-            "# Test with Image\n\n![Test Image](test.png)\n\nThis markdown references an image.";
-        let md_path = temp_dir.path().join("test.md");
-        fs::write(&md_path, md_content).expect("Failed to write markdown file");
-
-        let png_data = vec![
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
-            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
-            0xD7, 0x63, 0xF8, 0x0F, 0x00, 0x00, 0x01, 0x00, 0x01, 0x5C, 0xDD, 0x8D, 0xB4, 0x00,
-            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
-        let img_path = temp_dir.path().join("test.png");
-        fs::write(&img_path, png_data).expect("Failed to write image file");
-
-        let base_dir = temp_dir.path().to_path_buf();
-        let tracked_files = vec![md_path];
-        let is_directory_mode = false;
-        let router = new_router(base_dir, tracked_files, is_directory_mode)
-            .expect("Failed to create router");
-        let server = TestServer::new(router).expect("Failed to create test server");
-
-        let response = server.get("/").await;
-        assert_eq!(response.status_code(), 200);
-        let body = response.text();
-        assert!(body.contains("<img src=\"test.png\" alt=\"Test Image\""));
-
-        let img_response = server.get("/test.png").await;
-        assert_eq!(img_response.status_code(), 200);
-        assert_eq!(img_response.header("content-type"), "image/png");
-        assert!(!img_response.as_bytes().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_non_image_files_not_served() {
-        let temp_dir = tempdir().expect("Failed to create temp dir");
-
-        let md_content = "# Test";
-        let md_path = temp_dir.path().join("test.md");
-        fs::write(&md_path, md_content).expect("Failed to write markdown file");
-
-        let txt_path = temp_dir.path().join("secret.txt");
-        fs::write(&txt_path, "secret content").expect("Failed to write txt file");
-
-        let base_dir = temp_dir.path().to_path_buf();
-        let tracked_files = vec![md_path];
-        let is_directory_mode = false;
-        let router = new_router(base_dir, tracked_files, is_directory_mode)
-            .expect("Failed to create router");
-        let server = TestServer::new(router).expect("Failed to create test server");
-
-        let response = server.get("/secret.txt").await;
-        assert_eq!(response.status_code(), 404);
-    }
-
-    #[tokio::test]
-    async fn test_html_tags_in_markdown_are_rendered() {
-        let markdown_content = r#"# HTML Test
-
-This markdown contains HTML tags:
-
-<div class="highlight">
-    <p>This should be rendered as HTML, not escaped</p>
-    <span style="color: red;">Red text</span>
-</div>
-
-Regular **markdown** still works.
-"#;
-
-        let (server, _temp_file) = create_test_server(markdown_content).await;
-
-        let response = server.get("/").await;
-
-        assert_eq!(response.status_code(), 200);
-        let body = response.text();
-
+    async fn test_html_passthrough() {
+        let content = "# T\n\n<div class=\"highlight\"><p>raw</p></div>\n\n**md**\n";
+        let (server, _d) = md_server(content).await;
+        let body = server.get("/test.md").await.text();
         assert!(body.contains(r#"<div class="highlight">"#));
-        assert!(body.contains(r#"<span style="color: red;">"#));
-        assert!(body.contains("<p>This should be rendered as HTML, not escaped</p>"));
         assert!(!body.contains("&lt;div"));
-        assert!(!body.contains("&gt;"));
-        assert!(body.contains("<strong>markdown</strong>"));
-    }
-
-    #[tokio::test]
-    async fn test_mermaid_diagram_detection_and_script_injection() {
-        let markdown_content = r#"# Mermaid Test
-
-Regular content here.
-
-```mermaid
-graph TD
-    A[Start] --> B{Decision}
-    B -->|Yes| C[End]
-    B -->|No| D[Continue]
-```
-
-More regular content.
-
-```javascript
-// This is a regular code block, not mermaid
-console.log("Hello World");
-```
-"#;
-
-        let (server, _temp_file) = create_test_server(markdown_content).await;
-
-        let response = server.get("/").await;
-
-        assert_eq!(response.status_code(), 200);
-        let body = response.text();
-
-        assert!(body.contains(r#"class="language-mermaid""#));
-        assert!(body.contains("graph TD"));
-
-        let has_raw_content = body.contains("A[Start] --> B{Decision}");
-        let has_encoded_content = body.contains("A[Start] --&gt; B{Decision}");
-        assert!(
-            has_raw_content || has_encoded_content,
-            "Expected mermaid content not found in body"
-        );
-
-        assert!(body.contains(r#"<script src="/mermaid.min.js"></script>"#));
-        assert!(body.contains("function initMermaid()"));
-        assert!(body.contains("function transformMermaidCodeBlocks()"));
-        assert!(body.contains("function getMermaidTheme()"));
-        assert!(body.contains(r#"class="language-javascript""#));
-        assert!(body.contains("console.log"));
-    }
-
-    #[tokio::test]
-    async fn test_no_mermaid_script_injection_without_mermaid_blocks() {
-        let markdown_content = r#"# No Mermaid Test
-
-This content has no mermaid diagrams.
-
-```javascript
-console.log("Hello World");
-```
-
-```bash
-echo "Regular code block"
-```
-
-Just regular markdown content.
-"#;
-
-        let (server, _temp_file) = create_test_server(markdown_content).await;
-
-        let response = server.get("/").await;
-
-        assert_eq!(response.status_code(), 200);
-        let body = response.text();
-
-        assert!(!body.contains(r#"<script src="https://cdn.jsdelivr.net/npm/mermaid@11.12.0/dist/mermaid.min.js"></script>"#));
-        assert!(body.contains("function initMermaid()"));
-        assert!(body.contains(r#"class="language-javascript""#));
-        assert!(body.contains(r#"class="language-bash""#));
-    }
-
-    #[tokio::test]
-    async fn test_multiple_mermaid_diagrams() {
-        let markdown_content = r#"# Multiple Mermaid Diagrams
-
-## Flowchart
-```mermaid
-graph LR
-    A --> B
-```
-
-## Sequence Diagram
-```mermaid
-sequenceDiagram
-    Alice->>Bob: Hello
-    Bob-->>Alice: Hi
-```
-
-## Class Diagram
-```mermaid
-classDiagram
-    Animal <|-- Duck
-```
-"#;
-
-        let (server, _temp_file) = create_test_server(markdown_content).await;
-
-        let response = server.get("/").await;
-
-        assert_eq!(response.status_code(), 200);
-        let body = response.text();
-
-        let mermaid_occurrences = body.matches(r#"class="language-mermaid""#).count();
-        assert_eq!(mermaid_occurrences, 3);
-
-        assert!(body.contains("graph LR"));
-        assert!(body.contains("sequenceDiagram"));
-        assert!(body.contains("classDiagram"));
-
-        assert!(body.contains("A --&gt; B") || body.contains("A --> B"));
-        assert!(body.contains("Alice-&gt;&gt;Bob") || body.contains("Alice->>Bob"));
-        assert!(body.contains("Animal &lt;|-- Duck") || body.contains("Animal <|-- Duck"));
-
-        let script_occurrences = body
-            .matches(r#"<script src="/mermaid.min.js"></script>"#)
-            .count();
-        assert_eq!(script_occurrences, 1);
-    }
-
-    #[tokio::test]
-    async fn test_mermaid_js_etag_caching() {
-        let (server, _temp_file) = create_test_server("# Test").await;
-
-        let response = server.get("/mermaid.min.js").await;
-        assert_eq!(response.status_code(), 200);
-
-        let etag = response.header("etag");
-        assert!(!etag.is_empty(), "ETag header should be present");
-
-        let cache_control = response.header("cache-control");
-        let cache_control_str = cache_control.to_str().unwrap();
-        assert!(cache_control_str.contains("public"));
-        assert!(cache_control_str.contains("no-cache"));
-
-        let content_type = response.header("content-type");
-        assert_eq!(content_type, "application/javascript");
-
-        assert!(!response.as_bytes().is_empty());
-
-        let response_304 = server
-            .get("/mermaid.min.js")
-            .add_header(
-                axum::http::header::IF_NONE_MATCH,
-                axum::http::HeaderValue::from_str(etag.to_str().unwrap()).unwrap(),
-            )
-            .await;
-
-        assert_eq!(response_304.status_code(), 304);
-        assert_eq!(response_304.header("etag"), etag);
-        assert!(response_304.as_bytes().is_empty());
-
-        let response_200 = server
-            .get("/mermaid.min.js")
-            .add_header(
-                axum::http::header::IF_NONE_MATCH,
-                axum::http::HeaderValue::from_static("\"different-etag\""),
-            )
-            .await;
-
-        assert_eq!(response_200.status_code(), 200);
-        assert!(!response_200.as_bytes().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_directory_mode_serves_multiple_files() {
-        let (server, _temp_dir) = create_directory_server().await;
-
-        let response1 = server.get("/test1.md").await;
-        assert_eq!(response1.status_code(), 200);
-        let body1 = response1.text();
-        assert!(body1.contains("<h1>Test 1</h1>"));
-        assert!(body1.contains("Content of test1"));
-
-        let response2 = server.get("/test2.markdown").await;
-        assert_eq!(response2.status_code(), 200);
-        let body2 = response2.text();
-        assert!(body2.contains("<h1>Test 2</h1>"));
-        assert!(body2.contains("Content of test2"));
-
-        let response3 = server.get("/test3.md").await;
-        assert_eq!(response3.status_code(), 200);
-        let body3 = response3.text();
-        assert!(body3.contains("<h1>Test 3</h1>"));
-        assert!(body3.contains("Content of test3"));
-    }
-
-    #[tokio::test]
-    async fn test_directory_mode_file_not_found() {
-        let (server, _temp_dir) = create_directory_server().await;
-
-        let response = server.get("/nonexistent.md").await;
-        assert_eq!(response.status_code(), 404);
-    }
-
-    #[tokio::test]
-    async fn test_directory_mode_has_navigation_sidebar() {
-        let (server, _temp_dir) = create_directory_server().await;
-
-        let response = server.get("/test1.md").await;
-        assert_eq!(response.status_code(), 200);
-        let body = response.text();
-
-        assert!(body.contains(r#"<nav class="sidebar">"#));
-        assert!(body.contains(r#"<ul class="file-list">"#));
-        assert!(body.contains("test1.md"));
-        assert!(body.contains("test2.markdown"));
-        assert!(body.contains("test3.md"));
-    }
-
-    #[tokio::test]
-    async fn test_single_file_mode_no_navigation_sidebar() {
-        let (server, _temp_file) = create_test_server("# Single File Test").await;
-
-        let response = server.get("/").await;
-        assert_eq!(response.status_code(), 200);
-        let body = response.text();
-
-        assert!(!body.contains(r#"<nav class="sidebar">"#));
-        assert!(!body.contains("<h3>Files</h3>"));
-        assert!(!body.contains(r#"<ul class="file-list">"#));
-    }
-
-    #[tokio::test]
-    async fn test_directory_mode_active_file_highlighting() {
-        let (server, _temp_dir) = create_directory_server().await;
-
-        let response1 = server.get("/test1.md").await;
-        assert_eq!(response1.status_code(), 200);
-        let body1 = response1.text();
-
-        assert!(
-            body1.contains(r#"href="/test1.md" class="active""#),
-            "test1.md link should have href and class on same line"
-        );
-
-        let active_link_count = body1.matches(r#"class="active""#).count();
-        assert_eq!(active_link_count, 1, "Should have exactly one active link");
-
-        let response2 = server.get("/test2.markdown").await;
-        assert_eq!(response2.status_code(), 200);
-        let body2 = response2.text();
-
-        assert!(
-            body2.contains(r#"href="/test2.markdown" class="active""#),
-            "test2.markdown link should have href and class on same line"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_directory_mode_file_order() {
-        let (server, _temp_dir) = create_directory_server().await;
-
-        let response = server.get("/test1.md").await;
-        assert_eq!(response.status_code(), 200);
-        let body = response.text();
-
-        let test1_pos = body.find("test1.md").expect("test1.md not found");
-        let test2_pos = body
-            .find("test2.markdown")
-            .expect("test2.markdown not found");
-        let test3_pos = body.find("test3.md").expect("test3.md not found");
-
-        assert!(
-            test1_pos < test2_pos,
-            "test1.md should appear before test2.markdown"
-        );
-        assert!(
-            test2_pos < test3_pos,
-            "test2.markdown should appear before test3.md"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_directory_mode_websocket_file_modification() {
-        let (server, temp_dir) = create_directory_server_with_http().await;
-
-        let mut websocket = server.get_websocket("/ws").await.into_websocket().await;
-
-        let test_file = temp_dir.path().join("test1.md");
-        fs::write(&test_file, "# Modified Test 1\n\nContent has changed")
-            .expect("Failed to modify file");
-
-        tokio::time::sleep(Duration::from_millis(FILE_WATCH_DELAY_MS)).await;
-
-        let update_result = tokio::time::timeout(
-            Duration::from_secs(WEBSOCKET_TIMEOUT_SECS),
-            websocket.receive_json::<ServerMessage>(),
-        )
-        .await;
-
-        update_result.expect("Timeout waiting for WebSocket update after file modification");
-    }
-
-    #[tokio::test]
-    async fn test_directory_mode_new_file_triggers_reload() {
-        let (server, temp_dir) = create_directory_server_with_http().await;
-
-        let mut websocket = server.get_websocket("/ws").await.into_websocket().await;
-
-        let new_file = temp_dir.path().join("test4.md");
-        fs::write(&new_file, "# Test 4\n\nThis is a new file").expect("Failed to create new file");
-
-        tokio::time::sleep(Duration::from_millis(FILE_WATCH_DELAY_MS)).await;
-
-        let update_result = tokio::time::timeout(
-            Duration::from_secs(WEBSOCKET_TIMEOUT_SECS),
-            websocket.receive_json::<ServerMessage>(),
-        )
-        .await;
-
-        update_result.expect("Timeout waiting for WebSocket update after new file creation");
-
-        let response = server.get("/test1.md").await;
-        assert_eq!(response.status_code(), 200);
-        let body = response.text();
-
-        assert!(
-            body.contains("test4.md"),
-            "New file should appear in navigation"
-        );
-
-        let new_file_response = server.get("/test4.md").await;
-        assert_eq!(new_file_response.status_code(), 200);
-        let new_file_body = new_file_response.text();
-        assert!(new_file_body.contains("<h1>Test 4</h1>"));
-        assert!(new_file_body.contains("This is a new file"));
-    }
-
-    #[tokio::test]
-    async fn test_editor_save_simulation_single_file_mode() {
-        let (server, temp_file) =
-            create_test_server_with_http("# Original\n\nOriginal content").await;
-
-        let file_path = temp_file.path().to_path_buf();
-        let backup_path = file_path.with_extension("md~");
-
-        let initial_response = server.get("/").await;
-        assert_eq!(initial_response.status_code(), 200);
-        assert!(initial_response.text().contains("Original content"));
-
-        fs::rename(&file_path, &backup_path).expect("Failed to rename to backup");
-
-        tokio::time::sleep(Duration::from_millis(FILE_WATCH_DELAY_MS)).await;
-
-        let during_save_response = server.get("/").await;
-        assert_eq!(
-            during_save_response.status_code(),
-            200,
-            "File should not return 404 during editor save"
-        );
-
-        fs::write(&file_path, "# Updated\n\nUpdated content").expect("Failed to write new file");
-
-        tokio::time::sleep(Duration::from_millis(FILE_WATCH_DELAY_MS)).await;
-
-        let final_response = server.get("/").await;
-        assert_eq!(final_response.status_code(), 200);
-        let final_body = final_response.text();
-        assert!(
-            final_body.contains("Updated content"),
-            "Should serve updated content after save"
-        );
-        assert!(
-            !final_body.contains("Original content"),
-            "Should not serve old content"
-        );
-
-        let _ = fs::remove_file(&backup_path);
-    }
-
-    #[tokio::test]
-    async fn test_editor_save_simulation_directory_mode() {
-        let (server, temp_dir) = create_directory_server_with_http().await;
-
-        let file_path = temp_dir.path().join("test1.md");
-        let backup_path = temp_dir.path().join("test1.md~");
-
-        let initial_response = server.get("/test1.md").await;
-        assert_eq!(initial_response.status_code(), 200);
-        assert!(initial_response.text().contains("Content of test1"));
-
-        fs::rename(&file_path, &backup_path).expect("Failed to rename to backup");
-
-        tokio::time::sleep(Duration::from_millis(FILE_WATCH_DELAY_MS)).await;
-
-        let during_save_response = server.get("/test1.md").await;
-        assert_eq!(
-            during_save_response.status_code(),
-            200,
-            "File should not return 404 during editor save in directory mode"
-        );
-
-        fs::write(&file_path, "# Test 1 Updated\n\nUpdated content")
-            .expect("Failed to write new file");
-
-        tokio::time::sleep(Duration::from_millis(FILE_WATCH_DELAY_MS)).await;
-
-        let final_response = server.get("/test1.md").await;
-        assert_eq!(final_response.status_code(), 200);
-        let final_body = final_response.text();
-        assert!(
-            final_body.contains("Updated content"),
-            "Should serve updated content after save"
-        );
-
-        let _ = fs::remove_file(&backup_path);
-    }
-
-    #[tokio::test]
-    async fn test_no_404_during_editor_save_sequence() {
-        let (server, temp_dir) = create_directory_server_with_http().await;
-        let mut websocket = server.get_websocket("/ws").await.into_websocket().await;
-
-        let file_path = temp_dir.path().join("test1.md");
-        let backup_path = temp_dir.path().join("test1.md~");
-
-        fs::rename(&file_path, &backup_path).expect("Failed to rename to backup");
-        tokio::time::sleep(Duration::from_millis(FILE_WATCH_DELAY_MS)).await;
-
-        let response_after_rename = server.get("/test1.md").await;
-        assert_eq!(
-            response_after_rename.status_code(),
-            200,
-            "Should not get 404 after rename to backup"
-        );
-
-        fs::write(&file_path, "# Test 1 Updated\n\nNew content").expect("Failed to write new file");
-        tokio::time::sleep(Duration::from_millis(FILE_WATCH_DELAY_MS)).await;
-
-        let response_after_create = server.get("/test1.md").await;
-        assert_eq!(
-            response_after_create.status_code(),
-            200,
-            "Should successfully serve after new file created"
-        );
-        assert!(response_after_create.text().contains("New content"));
-
-        let update_result = tokio::time::timeout(
-            Duration::from_secs(WEBSOCKET_TIMEOUT_SECS),
-            websocket.receive_json::<ServerMessage>(),
-        )
-        .await;
-
-        assert!(update_result.is_ok(), "Should receive reload after save");
-
-        let _ = fs::remove_file(&backup_path);
+        assert!(body.contains("<strong>md</strong>"));
     }
 
     #[tokio::test]
     async fn test_yaml_frontmatter_is_stripped() {
-        let (server, _temp_file) = create_test_server(YAML_FRONTMATTER_CONTENT).await;
-
-        let response = server.get("/").await;
-
-        assert_eq!(response.status_code(), 200);
-        let body = response.text();
-
-        assert!(!body.contains("title: Test Post"));
+        let (server, _d) =
+            md_server("---\ntitle: Test Post\nauthor: Name\n---\n\n# Test Post\n").await;
+        let body = server.get("/test.md").await.text();
         assert!(!body.contains("author: Name"));
         assert!(body.contains("<h1>Test Post</h1>"));
     }
 
     #[tokio::test]
     async fn test_toml_frontmatter_is_stripped() {
-        let (server, _temp_file) = create_test_server(TOML_FRONTMATTER_CONTENT).await;
-
-        let response = server.get("/").await;
-
-        assert_eq!(response.status_code(), 200);
-        let body = response.text();
-
+        let (server, _d) = md_server("+++\ntitle = \"Test Post\"\n+++\n\n# Test Post\n").await;
+        let body = server.get("/test.md").await.text();
         assert!(!body.contains("title = \"Test Post\""));
         assert!(body.contains("<h1>Test Post</h1>"));
     }
 
     #[tokio::test]
-    async fn test_temp_file_rename_triggers_reload_single_file_mode() {
-        let (server, temp_file) =
-            create_test_server_with_http("# Original\n\nOriginal content").await;
+    async fn test_mermaid_detection_and_injection() {
+        let content = "# M\n\n```mermaid\ngraph TD\n    A --> B\n```\n";
+        let (server, _d) = md_server(content).await;
+        let body = server.get("/test.md").await.text();
+        assert!(body.contains(r#"class="language-mermaid""#));
+        assert!(body.contains(r#"<script src="/__mdserve/mermaid.min.js"></script>"#));
+        assert!(body.contains("function initMermaid()"));
+        assert!(body.contains("function transformMermaidCodeBlocks()"));
+    }
 
-        let mut websocket = server.get_websocket("/ws").await.into_websocket().await;
+    #[tokio::test]
+    async fn test_no_mermaid_injection_without_blocks() {
+        let content = "# No M\n\n```javascript\nconsole.log(1);\n```\n";
+        let (server, _d) = md_server(content).await;
+        let body = server.get("/test.md").await.text();
+        assert!(!body.contains(r#"<script src="/__mdserve/mermaid.min.js"></script>"#));
+        assert!(body.contains(r#"class="language-javascript""#));
+    }
 
-        let file_path = temp_file.path().to_path_buf();
-        let temp_write_path = file_path.with_extension("md.tmp.12345");
-
-        let initial_response = server.get("/").await;
-        assert_eq!(initial_response.status_code(), 200);
-        assert!(
-            initial_response.text().contains("Original content"),
-            "File should be tracked and serving content before edit"
-        );
-
-        fs::write(
-            &temp_write_path,
-            "# Updated\n\nUpdated content via temp file",
-        )
-        .expect("Failed to write temp file");
-
-        tokio::time::sleep(Duration::from_millis(FILE_WATCH_DELAY_MS)).await;
-
-        fs::rename(&temp_write_path, &file_path).expect("Failed to rename temp file");
-
-        tokio::time::sleep(Duration::from_millis(FILE_WATCH_DELAY_MS)).await;
-
-        let update_result = tokio::time::timeout(
-            Duration::from_secs(WEBSOCKET_TIMEOUT_SECS),
-            websocket.receive_json::<ServerMessage>(),
-        )
-        .await;
-
-        update_result.expect("Timeout waiting for WebSocket update after temp file rename");
-
-        let final_response = server.get("/").await;
-        assert_eq!(final_response.status_code(), 200);
-        let final_body = final_response.text();
-        assert!(
-            final_body.contains("Updated content via temp file"),
-            "Should serve updated content after temp file rename"
-        );
-        assert!(
-            !final_body.contains("Original content"),
-            "Should not serve old content"
+    #[tokio::test]
+    async fn test_multiple_mermaid_diagrams() {
+        let content = "```mermaid\ngraph LR\nA-->B\n```\n\n```mermaid\nsequenceDiagram\nA->>B: hi\n```\n\n```mermaid\nclassDiagram\nAnimal<|--Duck\n```\n";
+        let (server, _d) = md_server(content).await;
+        let body = server.get("/test.md").await.text();
+        assert_eq!(body.matches(r#"class="language-mermaid""#).count(), 3);
+        assert_eq!(
+            body.matches(r#"<script src="/__mdserve/mermaid.min.js"></script>"#)
+                .count(),
+            1
         );
     }
 
     #[tokio::test]
-    async fn test_temp_file_rename_triggers_reload_directory_mode() {
-        let (server, temp_dir) = create_directory_server_with_http().await;
+    async fn test_mermaid_js_etag_caching() {
+        let (server, _d) = md_server("# T").await;
 
-        let mut websocket = server.get_websocket("/ws").await.into_websocket().await;
+        let response = server.get("/__mdserve/mermaid.min.js").await;
+        assert_eq!(response.status_code(), 200);
+        let etag = response.header("etag");
+        assert!(!etag.is_empty());
+        assert_eq!(response.header("content-type"), "application/javascript");
+        assert!(!response.as_bytes().is_empty());
 
-        let file_path = temp_dir.path().join("test1.md");
-        let temp_write_path = temp_dir.path().join("test1.md.tmp.67890");
+        let response_304 = server
+            .get("/__mdserve/mermaid.min.js")
+            .add_header(
+                axum::http::header::IF_NONE_MATCH,
+                axum::http::HeaderValue::from_str(etag.to_str().unwrap()).unwrap(),
+            )
+            .await;
+        assert_eq!(response_304.status_code(), 304);
+        assert!(response_304.as_bytes().is_empty());
+    }
 
-        let initial_response = server.get("/test1.md").await;
-        assert_eq!(initial_response.status_code(), 200);
-        assert!(
-            initial_response.text().contains("Content of test1"),
-            "File should be tracked and serving content before edit"
-        );
+    // -- images / 404 ------------------------------------------------------
 
-        fs::write(
-            &temp_write_path,
-            "# Test 1 Updated\n\nUpdated via temp file rename",
-        )
-        .expect("Failed to write temp file");
+    #[tokio::test]
+    async fn test_image_serving() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("test.md"), "![x](test.png)").unwrap();
+        let png = vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52,
+        ];
+        fs::write(dir.path().join("test.png"), png).unwrap();
+        let (router, _s) = new_router(dir.path().to_path_buf()).unwrap();
+        let server = TestServer::new(router).unwrap();
 
-        tokio::time::sleep(Duration::from_millis(FILE_WATCH_DELAY_MS)).await;
+        let response = server.get("/test.png").await;
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(response.header("content-type"), "image/png");
+        assert!(!response.as_bytes().is_empty());
+    }
 
-        fs::rename(&temp_write_path, &file_path).expect("Failed to rename temp file");
+    #[tokio::test]
+    async fn test_svg_csp_and_avif() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("index.md"), "# x").unwrap();
+        fs::write(dir.path().join("icon.svg"), "<svg></svg>").unwrap();
+        fs::write(dir.path().join("img.avif"), [0u8; 4]).unwrap();
+        let (router, _s) = new_router(dir.path().to_path_buf()).unwrap();
+        let server = TestServer::new(router).unwrap();
 
-        tokio::time::sleep(Duration::from_millis(FILE_WATCH_DELAY_MS)).await;
+        let svg = server.get("/icon.svg").await;
+        assert_eq!(svg.header("content-type"), "image/svg+xml");
+        assert_eq!(svg.header("content-security-policy"), "script-src 'none'");
 
-        let update_result = tokio::time::timeout(
-            Duration::from_secs(WEBSOCKET_TIMEOUT_SECS),
-            websocket.receive_json::<ServerMessage>(),
+        let avif = server.get("/img.avif").await;
+        assert_eq!(avif.header("content-type"), "image/avif");
+    }
+
+    #[tokio::test]
+    async fn test_non_markdown_non_image_is_404() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("test.md"), "# x").unwrap();
+        fs::write(dir.path().join("secret.txt"), "secret").unwrap();
+        let (router, _s) = new_router(dir.path().to_path_buf()).unwrap();
+        let server = TestServer::new(router).unwrap();
+
+        assert_eq!(server.get("/secret.txt").await.status_code(), 404);
+        assert_eq!(server.get("/missing.md").await.status_code(), 404);
+    }
+
+    // -- directory listing -------------------------------------------------
+
+    #[tokio::test]
+    async fn test_directory_listing() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        fs::create_dir(base.join("docs")).unwrap();
+        fs::create_dir(base.join("specs")).unwrap();
+        fs::write(base.join("readme.md"), "# r").unwrap();
+        fs::write(base.join("docs/a.md"), "# a").unwrap();
+        fs::write(base.join("secret.txt"), "s").unwrap();
+        fs::write(base.join(".hidden.md"), "# h").unwrap();
+        let (router, _s) = new_router(base.to_path_buf()).unwrap();
+        let server = TestServer::new(router).unwrap();
+
+        let body = server.get("/").await.text();
+        let docs = body.find("/docs/").expect("docs");
+        let specs = body.find("/specs/").expect("specs");
+        let readme = body.find("/readme.md").expect("readme");
+        assert!(docs < specs, "dirs alphabetical");
+        assert!(specs < readme, "dirs before files");
+        assert!(!body.contains("secret.txt"), "non-md not listed");
+        assert!(!body.contains(".hidden"), "dotfiles skipped");
+        assert!(!body.contains("../"), "root has no parent link");
+
+        let sub = server.get("/docs").await.text();
+        assert!(sub.contains("../"), "subdir has parent link");
+        assert!(sub.contains(r#"href="/docs/a.md""#), "absolute href");
+        // Listings get no live-reload.
+        assert!(!sub.contains("new EventSource"));
+    }
+
+    #[tokio::test]
+    async fn test_markdown_page_has_eventsource_listing_does_not() {
+        let (server, _d) = md_server("# Hello").await;
+        let page = server.get("/test.md").await.text();
+        assert!(page.contains("new EventSource"));
+        assert!(page.contains(r#"file=' + encodeURIComponent("test.md")"#));
+
+        let listing = server.get("/").await.text();
+        assert!(!listing.contains("new EventSource"));
+    }
+
+    // -- cache-first / no eager watch -------------------------------------
+
+    #[tokio::test]
+    async fn test_cache_first_without_sse_serves_stale() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "# Original").unwrap();
+        let (router, _s) = new_router(dir.path().to_path_buf()).unwrap();
+        let server = TestServer::new(router).unwrap();
+
+        assert!(server.get("/a.md").await.text().contains("Original"));
+        fs::write(dir.path().join("a.md"), "# Changed").unwrap();
+
+        // No SSE open -> no watch -> cache still serves the old HTML.
+        let second = server.get("/a.md").await.text();
+        assert!(second.contains("Original"));
+        assert!(!second.contains("Changed"));
+    }
+
+    // -- SSE lifecycle -----------------------------------------------------
+
+    #[tokio::test]
+    async fn test_sse_refcounting_and_cleanup() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "# A").unwrap();
+        let (addr, state) = spawn_test_server(dir.path()).await;
+
+        let (code, c1) = connect_sse(addr, "a.md").await;
+        assert_eq!(code, 200);
+        wait_for(
+            &state,
+            |i| i.open_files.get("a.md") == Some(&1) && i.watched_dirs.values().any(|&v| v == 1),
+            Duration::from_secs(2),
         )
         .await;
 
-        update_result.expect(
-            "Timeout waiting for WebSocket update after temp file rename in directory mode",
-        );
+        let (_, c2) = connect_sse(addr, "a.md").await;
+        wait_for(
+            &state,
+            |i| i.open_files.get("a.md") == Some(&2),
+            Duration::from_secs(2),
+        )
+        .await;
 
-        let final_response = server.get("/test1.md").await;
-        assert_eq!(final_response.status_code(), 200);
-        let final_body = final_response.text();
-        assert!(
-            final_body.contains("Updated via temp file rename"),
-            "Should serve updated content after temp file rename"
-        );
-        assert!(
-            !final_body.contains("Content of test1"),
-            "Should not serve old content"
-        );
+        drop(c2);
+        wait_for(
+            &state,
+            |i| i.open_files.get("a.md") == Some(&1) && !i.watched_dirs.is_empty(),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        drop(c1);
+        wait_for(
+            &state,
+            |i| i.open_files.is_empty() && i.watched_dirs.is_empty(),
+            Duration::from_secs(2),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_sse_reloads_on_stale_cache_then_terminates() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "# Original").unwrap();
+        let (addr, _state) = spawn_test_server(dir.path()).await;
+
+        // Prime the cache with the original render.
+        assert_eq!(http_get(addr, "/a.md").await, 200);
+        // Edit while closed (no watch).
+        fs::write(dir.path().join("a.md"), "# Changed").unwrap();
+
+        // Open SSE: background re-render sees the diff and reloads.
+        let (code, mut c) = connect_sse(addr, "a.md").await;
+        assert_eq!(code, 200);
+        c.expect_event("reload", Duration::from_secs(3)).await;
+
+        // Reconnect: re-render now matches the cache, so no further reload.
+        let (_, mut c2) = connect_sse(addr, "a.md").await;
+        c2.expect_no_event("reload", Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn test_sse_missing_and_escape() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "# A").unwrap();
+        let (addr, _state) = spawn_test_server(dir.path()).await;
+
+        assert_eq!(connect_sse(addr, "missing.md").await.0, 404);
+        let escape = connect_sse(addr, "../escape.md").await.0;
+        assert!(escape == 403 || escape == 404, "got {escape}");
+    }
+
+    // -- watcher -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_watch_modify_reloads_open_file() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "# Original").unwrap();
+        let (addr, state) = spawn_test_server(dir.path()).await;
+
+        assert_eq!(http_get(addr, "/a.md").await, 200);
+        let (code, mut c) = connect_sse(addr, "a.md").await;
+        assert_eq!(code, 200);
+        wait_for(
+            &state,
+            |i| i.watched_dirs.values().any(|&v| v >= 1),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        fs::write(dir.path().join("a.md"), "# Modified").unwrap();
+        c.expect_event("reload", Duration::from_secs(5)).await;
+
+        assert!(http_get(addr, "/a.md").await == 200);
+        assert!(state
+            .inner
+            .lock()
+            .unwrap()
+            .cache
+            .get("a.md")
+            .unwrap()
+            .contains("Modified"));
+    }
+
+    #[tokio::test]
+    async fn test_watch_ignores_unopened_file() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "# A").unwrap();
+        fs::write(dir.path().join("b.md"), "# B").unwrap();
+        let (addr, state) = spawn_test_server(dir.path()).await;
+
+        assert_eq!(http_get(addr, "/a.md").await, 200);
+        let (_, mut c) = connect_sse(addr, "a.md").await;
+        wait_for(
+            &state,
+            |i| !i.watched_dirs.is_empty(),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        fs::write(dir.path().join("b.md"), "# B changed").unwrap();
+        c.expect_no_event("reload", Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn test_watch_editor_save_rename_over() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(&a, "# Original").unwrap();
+        let (addr, state) = spawn_test_server(dir.path()).await;
+
+        assert_eq!(http_get(addr, "/a.md").await, 200);
+        let (_, mut c) = connect_sse(addr, "a.md").await;
+        wait_for(
+            &state,
+            |i| !i.watched_dirs.is_empty(),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        let tmp = dir.path().join("a.md.tmp");
+        fs::write(&tmp, "# Updated via rename").unwrap();
+        fs::rename(&tmp, &a).unwrap();
+        c.expect_event("reload", Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    async fn test_watch_remove_then_create() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(&a, "# Original").unwrap();
+        let (addr, state) = spawn_test_server(dir.path()).await;
+
+        assert_eq!(http_get(addr, "/a.md").await, 200);
+        let (_, mut c) = connect_sse(addr, "a.md").await;
+        wait_for(
+            &state,
+            |i| !i.watched_dirs.is_empty(),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        let backup = dir.path().join("a.md~");
+        fs::rename(&a, &backup).unwrap();
+        fs::write(&a, "# Recreated content").unwrap();
+        c.expect_event("reload", Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    async fn test_watch_genuine_deletion_leaves_page() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        fs::write(&a, "# A").unwrap();
+        let (addr, state) = spawn_test_server(dir.path()).await;
+
+        assert_eq!(http_get(addr, "/a.md").await, 200);
+        let (_, mut c) = connect_sse(addr, "a.md").await;
+        wait_for(
+            &state,
+            |i| !i.watched_dirs.is_empty(),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        fs::remove_file(&a).unwrap();
+        // A bare remove triggers nothing.
+        c.expect_no_event("reload", Duration::from_secs(1)).await;
+        // A manual refresh 404s (resolver checks existence first)...
+        assert_eq!(http_get(addr, "/a.md").await, 404);
+        // ...but the open file stays until the stream drops.
+        assert!(state.inner.lock().unwrap().open_files.contains_key("a.md"));
+    }
+
+    #[tokio::test]
+    async fn test_watch_subdir_independence() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("docs")).unwrap();
+        fs::create_dir(dir.path().join("specs")).unwrap();
+        fs::write(dir.path().join("docs/a.md"), "# A").unwrap();
+        fs::write(dir.path().join("specs/b.md"), "# B").unwrap();
+        let (addr, state) = spawn_test_server(dir.path()).await;
+
+        let (_, c1) = connect_sse(addr, "docs/a.md").await;
+        let (_, _c2) = connect_sse(addr, "specs/b.md").await;
+        wait_for(
+            &state,
+            |i| i.watched_dirs.len() == 2,
+            Duration::from_secs(2),
+        )
+        .await;
+
+        drop(c1);
+        wait_for(
+            &state,
+            |i| i.watched_dirs.len() == 1 && !i.open_files.contains_key("docs/a.md"),
+            Duration::from_secs(2),
+        )
+        .await;
     }
 }

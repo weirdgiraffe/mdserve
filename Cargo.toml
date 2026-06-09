@@ -1,6 +1,6 @@
 [package]
 name = "mdserve"
-version = "1.1.0"
+version = "2.0.0"
 authors = ["Jose Fernandez <me@jrfernandez.com>"]
 edition = "2021"
 rust-version = "1.82.0"
@@ -11,18 +11,16 @@ homepage = "https://github.com/jfernandez/mdserve"
 documentation = "https://github.com/jfernandez/mdserve#readme"
 
 [dependencies]
-axum = { version = "0.7.9", features = ["ws"] }
-tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "net", "fs", "time"] }
+axum = "0.7.9"
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "net", "fs", "time", "sync", "io-util"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 markdown = "1.0"
 clap = { version = "4.5.45", features = ["derive"] }
-tower = "0.5.2"
 tower-http = { version = "0.6.6", features = ["fs", "cors"] }
 notify = "8.2.0"
-futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 anyhow = "1.0"
-minijinja = "2.12.0"
+minijinja = { version = "2.12.0", features = ["json"] }
 minijinja-embed = { version = "2.12.0", default-features = false }
 
 [build-dependencies]
@@ -35,6 +33,5 @@ codegen-units = 1
 panic = "abort"
 
 [dev-dependencies]
-axum-test = { version = "16.0", features = ["ws"] }
+axum-test = "16.0"
 tempfile = "3.0"
-tokio-test = "0.4"

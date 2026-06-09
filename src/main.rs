@@ -1,18 +1,20 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 
 mod app;
 
-use app::{scan_markdown_files, serve_markdown};
-
 #[derive(Parser)]
 #[command(name = "mdserve")]
-#[command(about = "A simple HTTP server for markdown preview")]
+#[command(about = "A markdown preview server for AI coding agents")]
 #[command(version)]
 struct Args {
-    /// Path to markdown file or directory to serve
-    path: PathBuf,
+    /// Initial file or directory to view, resolved under --base-dir [default: base dir]
+    path: Option<PathBuf>,
+
+    /// Security boundary; nothing outside is ever served [default: current directory]
+    #[arg(long)]
+    base_dir: Option<PathBuf>,
 
     /// Hostname (domain or IP address) to listen on
     #[arg(short = 'H', long, default_value = "127.0.0.1")]
@@ -22,7 +24,7 @@ struct Args {
     #[arg(short, long, default_value = "3000")]
     port: u16,
 
-    /// Open the preview in the default browser
+    /// Open the initial path in the default browser
     #[arg(short, long)]
     open: bool,
 }
@@ -30,37 +32,20 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let absolute_path = args.path.canonicalize().unwrap_or(args.path);
 
-    let (base_dir, tracked_files, is_directory_mode) = if absolute_path.is_file() {
-        // Single-file mode: derive parent directory
-        let base_dir = absolute_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .to_path_buf();
-        let tracked_files = vec![absolute_path];
-        (base_dir, tracked_files, false)
-    } else if absolute_path.is_dir() {
-        // Directory mode: scan directory for markdown files
-        let tracked_files = scan_markdown_files(&absolute_path)?;
-        if tracked_files.is_empty() {
-            anyhow::bail!("No markdown files found in directory");
-        }
-        (absolute_path, tracked_files, true)
-    } else {
-        anyhow::bail!("Path must be a file or directory");
+    let base_dir = match args.base_dir {
+        Some(dir) => dir,
+        None => std::env::current_dir().context("failed to determine current directory")?,
     };
+    let base_dir = base_dir
+        .canonicalize()
+        .with_context(|| format!("base-dir does not exist: {}", base_dir.display()))?;
+    if !base_dir.is_dir() {
+        anyhow::bail!("base-dir must be a directory: {}", base_dir.display());
+    }
 
-    // Single unified serve function
-    serve_markdown(
-        base_dir,
-        tracked_files,
-        is_directory_mode,
-        args.hostname,
-        args.port,
-        args.open,
-    )
-    .await?;
+    let path = args.path.unwrap_or_else(|| base_dir.clone());
+    let url_path = app::initial_url_path(&base_dir, &path)?;
 
-    Ok(())
+    app::serve(base_dir, url_path, args.hostname, args.port, args.open).await
 }
