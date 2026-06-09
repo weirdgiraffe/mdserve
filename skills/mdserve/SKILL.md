@@ -52,7 +52,7 @@ mdserve automatically finds an available port if the default (3000) is
 in use. Check the startup output for the actual URL and always tell the
 user the URL that mdserve reports.
 
-## Directory mode
+## Browsing multiple files
 
 When producing multiple related markdown files, serve the parent
 directory instead:
@@ -62,8 +62,10 @@ command: mdserve --open docs/
 run_in_background: true
 ```
 
-This gives the user a sidebar to navigate between files. Only the
-immediate directory is watched (non-recursive).
+A directory renders a browsable listing (subdirectories and markdown
+files). Everything under the base directory is reachable, so a document
+can link sideways to siblings (`../specs/server.md`). Each file is
+watched for live reload only while it is open in the browser.
 
 ## Mermaid diagrams
 

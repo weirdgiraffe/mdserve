@@ -16,14 +16,18 @@ required, no setup steps.
 about it. No runtime dependencies to manage.
 
 **Instant live reload.** File changes appear in the browser immediately via
-WebSocket. This is the core interaction: an agent writes, a human reads.
+Server-Sent Events. This is the core interaction: an agent writes, a human
+reads.
 
 **Ephemeral sessions.** Start it during a coding session, kill it when you're
 done. mdserve is not a long-running server and doesn't need to be.
 
-**Agent-friendly content.** Full GFM support (tables, task lists, code blocks),
-Mermaid diagrams, and directory mode with sidebar navigation - the kinds of
-content AI coding agents actually produce.
+**Browse the whole tree.** Point mdserve at a file or directory; everything
+under the base directory is browsable, so documents can link sideways to
+siblings. Directories render a simple listing.
+
+**Agent-friendly content.** Full GFM support (tables, task lists, code blocks)
+and Mermaid diagrams - the kinds of content AI coding agents actually produce.
 
 ## What mdserve is not
 
@@ -115,10 +119,13 @@ install at a different scope:
 ### Basic Usage
 
 ```bash
-# Serve a single markdown file on default port (3000)
+# Render a markdown file on the default port (3000)
 mdserve README.md
 
-# Serve all markdown files in a directory
+# List the current directory
+mdserve
+
+# List a specific directory
 mdserve docs/
 
 # Serve on custom port
@@ -132,15 +139,23 @@ mdserve README.md --hostname 0.0.0.0 --port 8080
 mdserve README.md --open
 ```
 
-### Single-File vs Directory Mode
+### Base directory and browsing
 
-**Single-File Mode**: When you pass a file path, mdserve serves that specific markdown file with a clean, focused view.
+The optional `PATH` argument is the initial view: a file renders, a directory
+renders a listing. Everything is resolved under `--base-dir` (default: the
+current directory), which is a security boundary — any file under it is
+browsable, and nothing above it is ever served.
 
-**Directory Mode**: When you pass a directory path, mdserve automatically:
-- Scans and serves all `.md` and `.markdown` files in that directory
-- Displays a navigation sidebar for easy switching between files
-- Watches for new markdown files added to the directory
-- Only monitors the immediate directory (non-recursive)
+```bash
+# Fence to ~/proj while opening one of its docs
+mdserve --base-dir ~/proj docs/api.md
+```
+
+A rendered document can link sideways (`../specs/server.md`) and the link
+resolves as long as the target lives under the base directory. A file is watched
+for live reload only while it is open in a browser; directories are listed fresh
+on each request. Listings show subdirectories and `.md`/`.markdown` files,
+non-recursively.
 
 
 ## Themes
@@ -169,11 +184,8 @@ cargo build --release
 ### Running Tests
 
 ```bash
-# Run all tests
+# Run all tests (unit + integration live inline in src/app.rs)
 cargo test
-
-# Run integration tests only
-cargo test --test integration_test
 ```
 
 ## Contributing

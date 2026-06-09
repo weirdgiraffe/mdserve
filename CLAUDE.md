@@ -11,7 +11,6 @@ See the [README](README.md) for project overview and the
 ```bash
 cargo build --release
 cargo test                            # all tests
-cargo test --test integration_test    # integration tests only
 ```
 
 Rust 1.82+, 2021 edition. Templates are embedded at compile time via
@@ -20,10 +19,12 @@ minijinja-embed (changes to `templates/` require a rebuild).
 ## Project structure
 
 - `src/main.rs` - CLI parsing and entry point
-- `src/app.rs` - Axum router, handlers, state management, file watcher
-- `src/lib.rs` - Markdown rendering
+- `src/app.rs` - Axum router, handlers, path resolver, markdown rendering,
+  lazy state, SSE live reload, file watcher
 - `templates/` - MiniJinja templates (Jinja2 syntax), embedded at compile time
-- `tests/integration_test.rs` - Integration tests using axum-test
+
+Tests live inline in `src/app.rs` (`#[cfg(test)] mod tests`); run them with
+plain `cargo test`.
 
 ## Design constraints
 
@@ -31,12 +32,14 @@ minijinja-embed (changes to `templates/` require a rebuild).
   during coding sessions. Features that push it toward a documentation platform,
   configurable server, or deployment target are out of scope.
 - **Zero config.** `mdserve file.md` must work with no flags or config files.
-- **Non-recursive.** Directory mode watches only the immediate directory, never
-  subdirectories. This is intentional.
-- **Pre-rendered in memory.** All tracked files are rendered to HTML on startup
-  and on change. Serving is always from memory.
+- **Base-dir boundary.** `--base-dir` (default: cwd) is a security fence. Any
+  file under it is browsable; nothing above it is ever served. This lets one
+  document link sideways to a sibling directory.
+- **Lazy render, permanent cache.** Nothing is scanned, rendered, or watched at
+  startup. A file is rendered on first request and cached forever; it is watched
+  only while open in a browser.
 - **Minimal client-side JS.** Most logic is server-side. Client JS handles
-  theme selection and WebSocket reload only.
+  theme selection and SSE reload only.
 
 ## Changelog
 
