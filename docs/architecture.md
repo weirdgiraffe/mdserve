@@ -27,12 +27,13 @@ There is **no file-vs-directory mode** and **no sidebar**. The CLI takes an
 optional `PATH` and an optional `--base-dir`:
 
 ```bash
-mdserve                       # list the current directory
+mdserve                       # list the project root
 mdserve ./docs/api.md         # render docs/api.md
 mdserve --base-dir ~/proj docs  # list ~/proj/docs, fenced to ~/proj
 ```
 
-`--base-dir` defaults to the current directory so that a file opened in one
+`--base-dir` defaults to the nearest ancestor directory holding a `.git` entry,
+and to the current directory when there is none, so that a file opened in one
 subdirectory can link to a sibling subdirectory (`../specs/server.md`) and still
 resolve inside the fence. A path that resolves to a directory renders a
 vim/netrw-style listing; navigation is browsing into directories plus links

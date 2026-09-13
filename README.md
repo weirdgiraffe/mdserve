@@ -122,7 +122,7 @@ install at a different scope:
 # Render a markdown file on the default port (3000)
 mdserve README.md
 
-# List the current directory
+# List the project root (or the current directory outside a repository)
 mdserve
 
 # List a specific directory
@@ -143,7 +143,8 @@ mdserve README.md --open
 
 The optional `PATH` argument is the initial view: a file renders, a directory
 renders a listing. Everything is resolved under `--base-dir` (default: the
-current directory), which is a security boundary — any file under it is
+nearest ancestor directory holding a `.git` entry, otherwise the current
+directory), which is a security boundary — any file under it is
 browsable, and nothing above it is ever served.
 
 ```bash
