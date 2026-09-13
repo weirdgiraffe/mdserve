@@ -31,7 +31,10 @@ use tower_http::cors::CorsLayer;
 const TEMPLATE_NAME: &str = "main.html";
 static TEMPLATE_ENV: OnceLock<Environment<'static>> = OnceLock::new();
 const MERMAID_JS: &str = include_str!("../static/js/mermaid.min.js");
-const MERMAID_ETAG: &str = concat!("\"", env!("CARGO_PKG_VERSION"), "\"");
+const HIGHLIGHT_JS: &str = include_str!("../static/js/highlight.min.js");
+const HIGHLIGHT_CSS_LIGHT: &str = include_str!("../static/css/github.min.css");
+const HIGHLIGHT_CSS_DARK: &str = include_str!("../static/css/github-dark.min.css");
+const ASSET_ETAG: &str = concat!("\"", env!("CARGO_PKG_VERSION"), "\"");
 const MAX_PORT_ATTEMPTS: u16 = 10;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -442,27 +445,54 @@ fn guess_image_content_type(file_path: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Mermaid asset
+// Embedded assets
 // ---------------------------------------------------------------------------
 
+const JAVASCRIPT_TYPE: &str = "application/javascript";
+const CSS_TYPE: &str = "text/css";
+
 async fn serve_mermaid_js(headers: HeaderMap) -> impl IntoResponse {
-    if is_etag_match(&headers) {
-        return mermaid_response(StatusCode::NOT_MODIFIED, None);
+    serve_asset(&headers, JAVASCRIPT_TYPE, MERMAID_JS)
+}
+
+async fn serve_highlight_js(headers: HeaderMap) -> impl IntoResponse {
+    serve_asset(&headers, JAVASCRIPT_TYPE, HIGHLIGHT_JS)
+}
+
+async fn serve_highlight_css_light(headers: HeaderMap) -> impl IntoResponse {
+    serve_asset(&headers, CSS_TYPE, HIGHLIGHT_CSS_LIGHT)
+}
+
+async fn serve_highlight_css_dark(headers: HeaderMap) -> impl IntoResponse {
+    serve_asset(&headers, CSS_TYPE, HIGHLIGHT_CSS_DARK)
+}
+
+fn serve_asset(
+    headers: &HeaderMap,
+    content_type: &'static str,
+    body: &'static str,
+) -> axum::response::Response {
+    if is_etag_match(headers) {
+        return asset_response(StatusCode::NOT_MODIFIED, content_type, None);
     }
-    mermaid_response(StatusCode::OK, Some(MERMAID_JS))
+    asset_response(StatusCode::OK, content_type, Some(body))
 }
 
 fn is_etag_match(headers: &HeaderMap) -> bool {
     headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|etags| etags.split(',').any(|tag| tag.trim() == MERMAID_ETAG))
+        .is_some_and(|etags| etags.split(',').any(|tag| tag.trim() == ASSET_ETAG))
 }
 
-fn mermaid_response(status: StatusCode, body: Option<&'static str>) -> impl IntoResponse {
+fn asset_response(
+    status: StatusCode,
+    content_type: &'static str,
+    body: Option<&'static str>,
+) -> axum::response::Response {
     let headers = [
-        (header::CONTENT_TYPE, "application/javascript"),
-        (header::ETAG, MERMAID_ETAG),
+        (header::CONTENT_TYPE, content_type),
+        (header::ETAG, ASSET_ETAG),
         (header::CACHE_CONTROL, "public, no-cache"),
     ];
 
@@ -668,6 +698,12 @@ fn new_router(base_dir: PathBuf) -> Result<(Router, Arc<AppState>)> {
     let router = Router::new()
         .route("/__mdserve/events", get(sse_handler))
         .route("/__mdserve/mermaid.min.js", get(serve_mermaid_js))
+        .route("/__mdserve/highlight.min.js", get(serve_highlight_js))
+        .route("/__mdserve/github.min.css", get(serve_highlight_css_light))
+        .route(
+            "/__mdserve/github-dark.min.css",
+            get(serve_highlight_css_dark),
+        )
         .route("/", get(serve_root))
         .route("/*path", get(serve_path))
         .layer(CorsLayer::permissive())
@@ -1153,6 +1189,45 @@ mod tests {
             .await;
         assert_eq!(response_304.status_code(), 304);
         assert!(response_304.as_bytes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_highlight_asset_serves_and_caches() {
+        let (server, _d) = md_server("# T").await;
+
+        let assets = [
+            ("/__mdserve/highlight.min.js", "application/javascript"),
+            ("/__mdserve/github.min.css", "text/css"),
+            ("/__mdserve/github-dark.min.css", "text/css"),
+        ];
+
+        for (path, content_type) in assets {
+            let response = server.get(path).await;
+            assert_eq!(response.status_code(), 200, "{path}");
+            assert_eq!(response.header("content-type"), content_type, "{path}");
+            assert!(!response.as_bytes().is_empty(), "{path}");
+
+            let etag = response.header("etag");
+            assert!(!etag.is_empty(), "{path}");
+
+            let response_304 = server
+                .get(path)
+                .add_header(
+                    axum::http::header::IF_NONE_MATCH,
+                    axum::http::HeaderValue::from_str(etag.to_str().unwrap()).unwrap(),
+                )
+                .await;
+            assert_eq!(response_304.status_code(), 304, "{path}");
+            assert!(response_304.as_bytes().is_empty(), "{path}");
+        }
+    }
+
+    #[test]
+    fn test_highlight_bundle_covers_the_languages() {
+        for language in ["Rust", "Go", "Python", "Bash", "JSON", "YAML", "SQL"] {
+            let marker = format!("name:\"{language}\"");
+            assert!(HIGHLIGHT_JS.contains(&marker), "{language}");
+        }
     }
 
     // -- images / 404 ------------------------------------------------------

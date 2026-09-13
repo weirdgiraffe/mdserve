@@ -189,6 +189,22 @@ cargo build --release
 cargo test
 ```
 
+### Vendored Assets
+
+Browser assets live under `static/` and are embedded in the binary at compile
+time, so the rendered page never touches the network. The syntax highlighting
+set comes from [highlight.js](https://cdnjs.com/libraries/highlight.js/11.11.2)
+version 11.11.2:
+
+| File | Source |
+| --- | --- |
+| `static/js/highlight.min.js` | `https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.2/highlight.min.js` |
+| `static/css/github.min.css` | `https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.2/styles/github.min.css` |
+| `static/css/github-dark.min.css` | `https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.2/styles/github-dark.min.css` |
+
+To refresh them, download the same paths at the new version and update this
+table.
+
 ## Contributing
 
 Contributions should enhance the agent-companion workflow. The best PRs improve
