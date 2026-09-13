@@ -317,6 +317,10 @@
     {% if mermaid_enabled %}
     <script src="/__mdserve/mermaid.min.js"></script>
     {% endif %}
+    {% if highlight_enabled %}
+    <link id="hljs-theme" rel="stylesheet" href="/__mdserve/github.min.css">
+    <script src="/__mdserve/highlight.min.js"></script>
+    {% endif %}
     <script>
         // Theme management
         function initTheme() {
@@ -342,6 +346,7 @@
             localStorage.setItem('theme', theme);
             updateThemeSelection(theme);
             updateMermaidTheme();
+            updateHighlightTheme();
             closeThemeModal();
         }
 
@@ -369,6 +374,21 @@
                 case 'catppuccin-latte':
                 default:
                     return 'default';
+            }
+        }
+
+        // Highlight.js stylesheet management
+        function getHighlightStylesheet() {
+            const currentTheme = document.documentElement.getAttribute('data-theme');
+            switch (currentTheme) {
+                case 'dark':
+                case 'catppuccin-macchiato':
+                case 'catppuccin-mocha':
+                    return '/__mdserve/github-dark.min.css';
+                case 'light':
+                case 'catppuccin-latte':
+                default:
+                    return '/__mdserve/github.min.css';
             }
         }
 
@@ -447,6 +467,28 @@
             }
         }
 
+        function updateHighlightTheme() {
+            const link = document.getElementById('hljs-theme');
+            if (link) {
+                link.setAttribute('href', getHighlightStylesheet());
+            }
+        }
+
+        function initHighlight() {
+            if (typeof hljs !== 'undefined') {
+                updateHighlightTheme();
+
+                // Mermaid blocks are diagrams, not code, and initMermaid()
+                // already replaced them. Painting one would race that replace.
+                const codeBlocks = document.querySelectorAll('pre code[class*="language-"]');
+                codeBlocks.forEach((codeElement) => {
+                    if (!codeElement.classList.contains('language-mermaid')) {
+                        hljs.highlightElement(codeElement);
+                    }
+                });
+            }
+        }
+
         // Live reload via Server-Sent Events. EventSource reconnects natively,
         // so no hand-rolled reconnect loop is needed. Only present when the
         // page is a rendered markdown file (listings get no reload channel).
@@ -466,6 +508,7 @@
         document.addEventListener('DOMContentLoaded', function() {
             initTheme();
             initMermaid();
+            initHighlight();
             setupLiveReload();
 
             // Modal close functionality

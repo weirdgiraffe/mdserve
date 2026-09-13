@@ -258,10 +258,15 @@ fn render_page(body_html: &str, reload_file: Option<&str>, page_title: &str) -> 
     };
 
     let mermaid_enabled = body_html.contains(r#"class="language-mermaid""#);
+    let highlight_enabled = body_html
+        .split(r#"class="language-"#)
+        .skip(1)
+        .any(|rest| !rest.starts_with(r#"mermaid""#));
 
     match template.render(context! {
         content => Value::from_safe_string(body_html.to_string()),
         mermaid_enabled => mermaid_enabled,
+        highlight_enabled => highlight_enabled,
         page_title => page_title,
         reload_file => reload_file,
     }) {
@@ -1154,6 +1159,27 @@ mod tests {
         let body = server.get("/test.md").await.text();
         assert!(!body.contains(r#"<script src="/__mdserve/mermaid.min.js"></script>"#));
         assert!(body.contains(r#"class="language-javascript""#));
+    }
+
+    #[tokio::test]
+    async fn test_highlight_injection_on_a_code_block() {
+        let content = "# R\n\n```rust\nfn main() {}\n```\n";
+        let (server, _d) = md_server(content).await;
+        let body = server.get("/test.md").await.text();
+        assert!(body.contains(r#"<script src="/__mdserve/highlight.min.js"></script>"#));
+        assert!(body.contains(r#"id="hljs-theme""#));
+    }
+
+    #[tokio::test]
+    async fn test_no_highlight_injection_without_a_code_block() {
+        let (prose, _d1) = md_server("# P\n\nJust a paragraph.\n").await;
+        let (diagram, _d2) = md_server("```mermaid\ngraph TD\n    A --> B\n```\n").await;
+
+        for server in [prose, diagram] {
+            let body = server.get("/test.md").await.text();
+            assert!(!body.contains(r#"<script src="/__mdserve/highlight.min.js"></script>"#));
+            assert!(!body.contains(r#"id="hljs-theme""#));
+        }
     }
 
     #[tokio::test]
