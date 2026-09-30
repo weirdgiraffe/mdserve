@@ -233,7 +233,64 @@ fn markdown_to_html(content: &str) -> String {
     options.parse.constructs.frontmatter = true;
 
     markdown::to_html_with_options(content, &options)
+        .map(|html| add_heading_anchors(&html))
         .unwrap_or_else(|_| "Error parsing markdown".to_string())
+}
+
+/// Give each `<hN>` a GitHub-style id and a `#` link to it, so that a link
+/// to a heading works and a reader can copy one.
+fn add_heading_anchors(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut rest = html;
+    while let Some(i) = rest.find("<h") {
+        out.push_str(&rest[..i]);
+        let tag = &rest[i..];
+        let b = tag.as_bytes();
+        if b.len() < 4 || !(b'1'..=b'6').contains(&b[2]) || b[3] != b'>' {
+            out.push_str("<h");
+            rest = &tag[2..];
+            continue;
+        }
+        let level = b[2] as char;
+        let close = format!("</h{level}>");
+        let Some(end) = tag.find(&close) else {
+            break;
+        };
+        let inner = &tag[4..end];
+        let slug = slugify(inner);
+        let n = seen.entry(slug.clone()).or_insert(0);
+        let id = if *n == 0 { slug } else { format!("{slug}-{n}") };
+        *n += 1;
+        out.push_str(&format!(
+            r##"<h{level} id="{id}"><a class="anchor" href="#{id}" aria-hidden="true">#</a>{inner}{close}"##
+        ));
+        rest = &tag[end + close.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// GitHub's heading slug: the text without tags and entities, lowercased,
+/// spaces to hyphens, other punctuation dropped.
+fn slugify(inner_html: &str) -> String {
+    let mut slug = String::new();
+    let mut in_tag = false;
+    let mut in_entity = false;
+    for c in inner_html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            '&' if !in_tag => in_entity = true,
+            ';' if in_entity => in_entity = false,
+            _ if in_tag || in_entity => {}
+            ' ' | '-' => slug.push('-'),
+            '_' => slug.push('_'),
+            c if c.is_alphanumeric() => slug.extend(c.to_lowercase()),
+            _ => {}
+        }
+    }
+    slug
 }
 
 fn html_escape(s: &str) -> String {
@@ -1096,7 +1153,7 @@ mod tests {
         let response = server.get("/test.md").await;
         assert_eq!(response.status_code(), 200);
         let body = response.text();
-        assert!(body.contains("<h1>Hello World</h1>"));
+        assert!(body.contains("#</a>Hello World</h1>"));
         assert!(body.contains("<strong>bold</strong>"));
         assert!(body.contains("theme-toggle"));
         assert!(body.contains("--bg-color"));
@@ -1115,6 +1172,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_heading_anchors() {
+        let content = "# Hello, World!\n\n## Set `up` & run\n\n## Set up & run\n\n### Ünïcode 2\n";
+        let (server, _d) = md_server(content).await;
+        let body = server.get("/test.md").await.text();
+        assert!(body.contains(
+            r##"<h1 id="hello-world"><a class="anchor" href="#hello-world" aria-hidden="true">#</a>Hello, World!</h1>"##
+        ));
+        assert!(body.contains(r#"<h2 id="set-up--run">"#));
+        assert!(body.contains(r#"<h2 id="set-up--run-1">"#));
+        assert!(body.contains(r#"<h3 id="ünïcode-2">"#));
+    }
+
+    #[tokio::test]
     async fn test_html_passthrough() {
         let content = "# T\n\n<div class=\"highlight\"><p>raw</p></div>\n\n**md**\n";
         let (server, _d) = md_server(content).await;
@@ -1130,7 +1200,7 @@ mod tests {
             md_server("---\ntitle: Test Post\nauthor: Name\n---\n\n# Test Post\n").await;
         let body = server.get("/test.md").await.text();
         assert!(!body.contains("author: Name"));
-        assert!(body.contains("<h1>Test Post</h1>"));
+        assert!(body.contains("#</a>Test Post</h1>"));
     }
 
     #[tokio::test]
@@ -1138,7 +1208,7 @@ mod tests {
         let (server, _d) = md_server("+++\ntitle = \"Test Post\"\n+++\n\n# Test Post\n").await;
         let body = server.get("/test.md").await.text();
         assert!(!body.contains("title = \"Test Post\""));
-        assert!(body.contains("<h1>Test Post</h1>"));
+        assert!(body.contains("#</a>Test Post</h1>"));
     }
 
     #[tokio::test]
@@ -1656,6 +1726,6 @@ mod tests {
         // Any other path under the prefix is plain content.
         let note = server.get("/__mdserve/note.md").await;
         assert_eq!(note.status_code(), 200);
-        assert!(note.text().contains("<h1>Note</h1>"));
+        assert!(note.text().contains("#</a>Note</h1>"));
     }
 }
