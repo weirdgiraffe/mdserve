@@ -7,11 +7,15 @@
 
     <!-- Critical: Apply theme before first paint to prevent flash -->
     <script>
-        (function() {
-            const theme = localStorage.getItem('theme') || 'catppuccin-mocha';
-            document.documentElement.setAttribute('data-theme', theme);
-            document.documentElement.classList.add('theme-initialized');
-        })();
+        // The mode is light, dark, or auto. Auto follows the system.
+        function applyThemeMode(mode) {
+            const dark = mode === 'dark' ||
+                (mode !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches);
+            document.documentElement.setAttribute('data-mode', mode);
+            document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+        }
+        applyThemeMode(localStorage.getItem('theme-mode') || 'auto');
+        document.documentElement.classList.add('theme-initialized');
     </script>
 
     <style>
@@ -30,62 +34,30 @@
             box-sizing: border-box;
         }
 
+        /* Everforest (medium), https://github.com/sainnhe/everforest */
         :root {
-            --bg-color: #fff;
-            --text-color: #333;
-            --border-color: #eaecef;
-            --border-color-light: #dfe2e5;
-            --code-bg: #f6f8fa;
-            --blockquote-color: #6a737d;
-            --link-color: #0366d6;
-            --table-header-bg: #f6f8fa;
+            --bg-color: #fdf6e3;
+            --text-color: #5c6a72;
+            --border-color: #e0dcc7;
+            --border-color-light: #e6e2cc;
+            --code-bg: #f4f0d9;
+            --blockquote-color: #829181;
+            --link-color: #3a94c5;
+            --table-header-bg: #efebd4;
             --content-max-width: 900px;
             --transition-speed: 0.3s;
             --transition-timing: ease;
         }
 
         [data-theme="dark"] {
-            --bg-color: #0d1117;
-            --text-color: #e6edf3;
-            --border-color: #30363d;
-            --border-color-light: #21262d;
-            --code-bg: #161b22;
-            --blockquote-color: #8b949e;
-            --link-color: #58a6ff;
-            --table-header-bg: #161b22;
-        }
-
-        [data-theme="catppuccin-latte"] {
-            --bg-color: #eff1f5;
-            --text-color: #4c4f69;
-            --border-color: #bcc0cc;
-            --border-color-light: #ccd0da;
-            --code-bg: #e6e9ef;
-            --blockquote-color: #6c6f85;
-            --link-color: #1e66f5;
-            --table-header-bg: #ccd0da;
-        }
-
-        [data-theme="catppuccin-macchiato"] {
-            --bg-color: #24273a;
-            --text-color: #cad3f5;
-            --border-color: #494d64;
-            --border-color-light: #363a4f;
-            --code-bg: #1e2030;
-            --blockquote-color: #a5adcb;
-            --link-color: #8aadf4;
-            --table-header-bg: #363a4f;
-        }
-
-        [data-theme="catppuccin-mocha"] {
-            --bg-color: #1e1e2e;
-            --text-color: #cdd6f4;
-            --border-color: #45475a;
-            --border-color-light: #313244;
-            --code-bg: #181825;
-            --blockquote-color: #a6adc8;
-            --link-color: #89b4fa;
-            --table-header-bg: #313244;
+            --bg-color: #2d353b;
+            --text-color: #d3c6aa;
+            --border-color: #4f585e;
+            --border-color-light: #475258;
+            --code-bg: #343f44;
+            --blockquote-color: #9da9a0;
+            --link-color: #7fbbb3;
+            --table-header-bg: #3d484d;
         }
 
         /* Common body styles */
@@ -126,10 +98,15 @@
             text-decoration: underline;
         }
 
-        .theme-toggle {
+        .theme-picker {
             position: fixed;
             top: 20px;
             right: 20px;
+            z-index: 100;
+        }
+
+        .theme-toggle,
+        .theme-menu button {
             background: var(--code-bg);
             border: 1px solid var(--border-color-light);
             border-radius: 6px;
@@ -139,130 +116,41 @@
             color: var(--text-color);
             transition: background 0.2s var(--transition-timing),
                         border-color var(--transition-speed) var(--transition-timing);
-            z-index: 100;
         }
 
         .theme-toggle:hover,
-        .theme-toggle:focus-visible {
+        .theme-toggle:focus-visible,
+        .theme-menu button:hover,
+        .theme-menu button:focus-visible {
             background: var(--border-color-light);
             outline: none;
         }
 
-        .theme-modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
+        .theme-menu {
+            position: absolute;
+            right: 0;
+            margin: 4px 0 0;
+            padding: 0;
+            list-style: none;
+        }
+
+        .theme-menu button {
             width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.5);
-            z-index: 1000;
-            backdrop-filter: blur(4px);
+            text-align: left;
+            white-space: nowrap;
+            border-radius: 0;
         }
 
-        .theme-modal.show {
-            display: flex;
-            align-items: center;
-            justify-content: center;
+        .theme-menu li + li button {
+            border-top: none;
         }
 
-        .theme-modal-content {
-            background: var(--bg-color);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            padding: 24px;
-            max-width: 600px;
-            width: 90%;
-            max-height: 80vh;
-            overflow-y: auto;
-        }
-
-        .theme-modal h3 {
-            margin: 0 0 20px 0;
-            color: var(--text-color);
-            font-size: 18px;
-            text-align: center;
-        }
-
-        .theme-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-            gap: 16px;
-        }
-
-        .theme-card {
-            border: 2px solid transparent;
-            border-radius: 8px;
-            padding: 16px;
-            cursor: pointer;
-            transition: all 0.2s ease;
-            text-align: center;
-        }
-
-        .theme-card:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-        }
-
-        .theme-card.selected {
-            border-color: var(--link-color);
-            box-shadow: 0 0 0 1px var(--link-color);
-        }
-
-        .theme-card-icon {
-            font-size: 24px;
-            margin-bottom: 8px;
-        }
-
-        .theme-card-name {
-            font-size: 14px;
+        .theme-menu button.selected {
             font-weight: 600;
-            margin-bottom: 12px;
         }
 
-        .theme-card-preview {
-            display: flex;
-            gap: 4px;
-            justify-content: center;
-            margin-bottom: 8px;
-        }
-
-        .theme-color-swatch {
-            width: 16px;
-            height: 16px;
-            border-radius: 3px;
-            border: 1px solid rgba(0, 0, 0, 0.1);
-        }
-
-        .theme-card-sample {
-            font-size: 11px;
-            opacity: 0.8;
-        }
-
-        /* Theme-specific card styles */
-        .theme-card[data-theme="light"] {
-            background: #fff;
-            color: #333;
-        }
-
-        .theme-card[data-theme="dark"] {
-            background: #0d1117;
-            color: #e6edf3;
-        }
-
-        .theme-card[data-theme="catppuccin-latte"] {
-            background: #eff1f5;
-            color: #4c4f69;
-        }
-
-        .theme-card[data-theme="catppuccin-macchiato"] {
-            background: #24273a;
-            color: #cad3f5;
-        }
-
-        .theme-card[data-theme="catppuccin-mocha"] {
-            background: #1e1e2e;
-            color: #cdd6f4;
+        .theme-menu button.selected::after {
+            content: " ✓";
         }
 
         pre {
@@ -331,74 +219,51 @@
     <script src="/__mdserve/highlight.min.js"></script>
     {% endif %}
     <script>
-        // Theme management
-        function initTheme() {
-            // Theme is already set by the early script to prevent flash
-            // Just update the theme selection UI to match current theme
-            const currentTheme = document.documentElement.getAttribute('data-theme');
-            updateThemeSelection(currentTheme);
-        }
+        // Theme management. applyThemeMode() in the early script sets
+        // data-mode and data-theme; this code keeps the page in sync.
+        const THEME_ICONS = { light: '☀️', dark: '🌙', auto: '🌓' };
 
-        function openThemeModal() {
-            const modal = document.getElementById('themeModal');
-            modal.classList.add('show');
-            updateThemeSelection(document.documentElement.getAttribute('data-theme'));
-        }
-
-        function closeThemeModal() {
-            const modal = document.getElementById('themeModal');
-            modal.classList.remove('show');
-        }
-
-        function selectTheme(theme) {
-            document.documentElement.setAttribute('data-theme', theme);
-            localStorage.setItem('theme', theme);
-            updateThemeSelection(theme);
-            updateMermaidTheme();
-            updateHighlightTheme();
-            closeThemeModal();
-        }
-
-        function updateThemeSelection(selectedTheme) {
-            // Update all theme cards to show selection state
-            const cards = document.querySelectorAll('.theme-card');
-            cards.forEach(card => {
-                if (card.dataset.theme === selectedTheme) {
-                    card.classList.add('selected');
-                } else {
-                    card.classList.remove('selected');
-                }
+        function updateThemeButton() {
+            const mode = document.documentElement.getAttribute('data-mode');
+            const button = document.getElementById('themeToggle');
+            button.textContent = THEME_ICONS[mode];
+            button.title = 'Theme: ' + mode;
+            document.querySelectorAll('.theme-menu button').forEach((item) => {
+                item.classList.toggle('selected', item.dataset.mode === mode);
             });
         }
 
-        // Mermaid theme management
-        function getMermaidTheme() {
-            const currentTheme = document.documentElement.getAttribute('data-theme');
-            switch (currentTheme) {
-                case 'dark':
-                case 'catppuccin-macchiato':
-                case 'catppuccin-mocha':
-                    return 'dark';
-                case 'light':
-                case 'catppuccin-latte':
-                default:
-                    return 'default';
-            }
+        function onThemeChange() {
+            updateThemeButton();
+            updateMermaidTheme();
+            updateHighlightTheme();
         }
 
-        // Highlight.js stylesheet management
+        function toggleThemeMenu() {
+            document.getElementById('themeMenu').toggleAttribute('hidden');
+        }
+
+        function closeThemeMenu() {
+            document.getElementById('themeMenu').setAttribute('hidden', '');
+        }
+
+        function selectThemeMode(mode) {
+            localStorage.setItem('theme-mode', mode);
+            applyThemeMode(mode);
+            onThemeChange();
+            closeThemeMenu();
+        }
+
+        function isDarkTheme() {
+            return document.documentElement.getAttribute('data-theme') === 'dark';
+        }
+
+        function getMermaidTheme() {
+            return isDarkTheme() ? 'dark' : 'default';
+        }
+
         function getHighlightStylesheet() {
-            const currentTheme = document.documentElement.getAttribute('data-theme');
-            switch (currentTheme) {
-                case 'dark':
-                case 'catppuccin-macchiato':
-                case 'catppuccin-mocha':
-                    return '/__mdserve/github-dark.min.css';
-                case 'light':
-                case 'catppuccin-latte':
-                default:
-                    return '/__mdserve/github.min.css';
-            }
+            return isDarkTheme() ? '/__mdserve/github-dark.min.css' : '/__mdserve/github.min.css';
         }
 
         function initMermaid() {
@@ -515,96 +380,46 @@
 
         // Initialize theme and live reload on page load
         document.addEventListener('DOMContentLoaded', function() {
-            initTheme();
+            updateThemeButton();
             initMermaid();
             initHighlight();
             setupLiveReload();
 
-            // Modal close functionality
-            const modal = document.getElementById('themeModal');
-
-            // Close modal when clicking outside
-            modal.addEventListener('click', function(e) {
-                if (e.target === modal) {
-                    closeThemeModal();
+            // In auto mode, follow a change of the system preference.
+            matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function() {
+                if (document.documentElement.getAttribute('data-mode') === 'auto') {
+                    applyThemeMode('auto');
+                    onThemeChange();
                 }
             });
 
-            // Close modal with ESC key
+            // Close the menu on a click outside the picker, or on ESC.
+            const picker = document.querySelector('.theme-picker');
+            document.addEventListener('click', function(e) {
+                if (!picker.contains(e.target)) {
+                    closeThemeMenu();
+                }
+            });
             document.addEventListener('keydown', function(e) {
-                if (e.key === 'Escape' && modal.classList.contains('show')) {
-                    closeThemeModal();
+                if (e.key === 'Escape') {
+                    closeThemeMenu();
                 }
             });
         });
     </script>
 </head>
 <body>
-<button class="theme-toggle" onclick="openThemeModal()">🎨</button>
+<div class="theme-picker">
+    <button class="theme-toggle" id="themeToggle" onclick="toggleThemeMenu()"></button>
+    <ul class="theme-menu" id="themeMenu" hidden>
+        <li><button data-mode="light" onclick="selectThemeMode('light')">☀️ Light</button></li>
+        <li><button data-mode="dark" onclick="selectThemeMode('dark')">🌙 Dark</button></li>
+        <li><button data-mode="auto" onclick="selectThemeMode('auto')">🌓 Auto</button></li>
+    </ul>
+</div>
 <div id="content">
 {{ content }}
 </div>
 
-<div class="theme-modal" id="themeModal">
-    <div class="theme-modal-content">
-        <h3>Choose Theme</h3>
-        <div class="theme-grid">
-            <div class="theme-card" data-theme="catppuccin-latte" onclick="selectTheme('catppuccin-latte')">
-                <div class="theme-card-icon">☕</div>
-                <div class="theme-card-name">Catppuccin Latte</div>
-                <div class="theme-card-preview">
-                    <div class="theme-color-swatch" style="background: #eff1f5;"></div>
-                    <div class="theme-color-swatch" style="background: #4c4f69;"></div>
-                    <div class="theme-color-swatch" style="background: #1e66f5;"></div>
-                </div>
-                <div class="theme-card-sample">Warm light theme</div>
-            </div>
-
-            <div class="theme-card" data-theme="catppuccin-macchiato" onclick="selectTheme('catppuccin-macchiato')">
-                <div class="theme-card-icon">🥛</div>
-                <div class="theme-card-name">Catppuccin Macchiato</div>
-                <div class="theme-card-preview">
-                    <div class="theme-color-swatch" style="background: #24273a;"></div>
-                    <div class="theme-color-swatch" style="background: #cad3f5;"></div>
-                    <div class="theme-color-swatch" style="background: #8aadf4;"></div>
-                </div>
-                <div class="theme-card-sample">Medium contrast</div>
-            </div>
-
-            <div class="theme-card" data-theme="catppuccin-mocha" onclick="selectTheme('catppuccin-mocha')">
-                <div class="theme-card-icon">🐱</div>
-                <div class="theme-card-name">Catppuccin Mocha</div>
-                <div class="theme-card-preview">
-                    <div class="theme-color-swatch" style="background: #1e1e2e;"></div>
-                    <div class="theme-color-swatch" style="background: #cdd6f4;"></div>
-                    <div class="theme-color-swatch" style="background: #89b4fa;"></div>
-                </div>
-                <div class="theme-card-sample">Dark and cozy</div>
-            </div>
-
-            <div class="theme-card" data-theme="light" onclick="selectTheme('light')">
-                <div class="theme-card-icon">☀️</div>
-                <div class="theme-card-name">Light</div>
-                <div class="theme-card-preview">
-                    <div class="theme-color-swatch" style="background: #fff;"></div>
-                    <div class="theme-color-swatch" style="background: #333;"></div>
-                    <div class="theme-color-swatch" style="background: #0366d6;"></div>
-                </div>
-                <div class="theme-card-sample">Classic bright</div>
-            </div>
-
-            <div class="theme-card" data-theme="dark" onclick="selectTheme('dark')">
-                <div class="theme-card-icon">🌙</div>
-                <div class="theme-card-name">Dark</div>
-                <div class="theme-card-preview">
-                    <div class="theme-color-swatch" style="background: #0d1117;"></div>
-                    <div class="theme-color-swatch" style="background: #e6edf3;"></div>
-                    <div class="theme-color-swatch" style="background: #58a6ff;"></div>
-                </div>
-                <div class="theme-card-sample">Classic dark</div>
-            </div>
-        </div>
-    </div>
-</div>
 </body>
 </html>

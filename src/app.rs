@@ -1157,7 +1157,13 @@ mod tests {
         assert!(body.contains("<strong>bold</strong>"));
         assert!(body.contains("theme-toggle"));
         assert!(body.contains("--bg-color"));
-        assert!(body.contains("data-theme=\"dark\""));
+        // One Everforest theme, in a light, a dark, and an auto mode.
+        assert!(body.contains("#2d353b"), "everforest dark bg");
+        assert!(body.contains("#fdf6e3"), "everforest light bg");
+        for mode in ["light", "dark", "auto"] {
+            assert!(body.contains(&format!("selectThemeMode('{mode}')")), "{mode}");
+        }
+        assert!(!body.contains("catppuccin"));
     }
 
     #[tokio::test]

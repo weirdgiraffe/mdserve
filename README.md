@@ -161,8 +161,10 @@ non-recursively.
 
 ## Themes
 
-Five built-in themes (light, dark, and Catppuccin variants) accessible from the
-theme picker in the top-right corner. Your choice persists across sessions.
+mdserve uses the [Everforest](https://github.com/sainnhe/everforest) color
+scheme for the page and for the code. The button in the top-right corner selects
+the light, the dark, or the auto mode. Auto follows the system preference and is
+the default. Your choice persists across sessions.
 
 ![mdserve with Catppuccin Macchiato theme](mdserve-catppuccin-macchiato.png)
 
@@ -225,5 +227,5 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - Built with [Axum](https://github.com/tokio-rs/axum) web framework
 - Markdown parsing by [markdown-rs](https://github.com/wooorm/markdown-rs)
-- [Catppuccin](https://catppuccin.com/) color themes
+- [Everforest](https://github.com/sainnhe/everforest) color scheme
 - Inspired by various markdown preview tools
