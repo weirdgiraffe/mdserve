@@ -32,8 +32,6 @@ const TEMPLATE_NAME: &str = "main.html";
 static TEMPLATE_ENV: OnceLock<Environment<'static>> = OnceLock::new();
 const MERMAID_JS: &str = include_str!("../static/js/mermaid.min.js");
 const HIGHLIGHT_JS: &str = include_str!("../static/js/highlight.min.js");
-const HIGHLIGHT_CSS_LIGHT: &str = include_str!("../static/css/github.min.css");
-const HIGHLIGHT_CSS_DARK: &str = include_str!("../static/css/github-dark.min.css");
 const ASSET_ETAG: &str = concat!("\"", env!("CARGO_PKG_VERSION"), "\"");
 const MAX_PORT_ATTEMPTS: u16 = 10;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -511,7 +509,6 @@ fn guess_image_content_type(file_path: &str) -> String {
 // ---------------------------------------------------------------------------
 
 const JAVASCRIPT_TYPE: &str = "application/javascript";
-const CSS_TYPE: &str = "text/css";
 
 async fn serve_mermaid_js(headers: HeaderMap) -> impl IntoResponse {
     serve_asset(&headers, JAVASCRIPT_TYPE, MERMAID_JS)
@@ -519,14 +516,6 @@ async fn serve_mermaid_js(headers: HeaderMap) -> impl IntoResponse {
 
 async fn serve_highlight_js(headers: HeaderMap) -> impl IntoResponse {
     serve_asset(&headers, JAVASCRIPT_TYPE, HIGHLIGHT_JS)
-}
-
-async fn serve_highlight_css_light(headers: HeaderMap) -> impl IntoResponse {
-    serve_asset(&headers, CSS_TYPE, HIGHLIGHT_CSS_LIGHT)
-}
-
-async fn serve_highlight_css_dark(headers: HeaderMap) -> impl IntoResponse {
-    serve_asset(&headers, CSS_TYPE, HIGHLIGHT_CSS_DARK)
 }
 
 fn serve_asset(
@@ -761,11 +750,6 @@ fn new_router(base_dir: PathBuf) -> Result<(Router, Arc<AppState>)> {
         .route("/__mdserve/events", get(sse_handler))
         .route("/__mdserve/mermaid.min.js", get(serve_mermaid_js))
         .route("/__mdserve/highlight.min.js", get(serve_highlight_js))
-        .route("/__mdserve/github.min.css", get(serve_highlight_css_light))
-        .route(
-            "/__mdserve/github-dark.min.css",
-            get(serve_highlight_css_dark),
-        )
         .route("/", get(serve_root))
         .route("/*path", get(serve_path))
         .layer(CorsLayer::permissive())
@@ -1161,7 +1145,10 @@ mod tests {
         assert!(body.contains("#2d353b"), "everforest dark bg");
         assert!(body.contains("#fdf6e3"), "everforest light bg");
         for mode in ["light", "dark", "auto"] {
-            assert!(body.contains(&format!("selectThemeMode('{mode}')")), "{mode}");
+            assert!(
+                body.contains(&format!("selectThemeMode('{mode}')")),
+                "{mode}"
+            );
         }
         assert!(!body.contains("catppuccin"));
     }
@@ -1243,7 +1230,10 @@ mod tests {
         let (server, _d) = md_server(content).await;
         let body = server.get("/test.md").await.text();
         assert!(body.contains(r#"<script src="/__mdserve/highlight.min.js"></script>"#));
-        assert!(body.contains(r#"id="hljs-theme""#));
+        // The tokens take the Everforest colors of the page. A second
+        // stylesheet would paint its own box inside the code block.
+        assert!(body.contains(".hljs-keyword"));
+        assert!(!body.contains(".min.css"));
     }
 
     #[tokio::test]
@@ -1254,7 +1244,6 @@ mod tests {
         for server in [prose, diagram] {
             let body = server.get("/test.md").await.text();
             assert!(!body.contains(r#"<script src="/__mdserve/highlight.min.js"></script>"#));
-            assert!(!body.contains(r#"id="hljs-theme""#));
         }
     }
 
@@ -1297,13 +1286,7 @@ mod tests {
     async fn test_highlight_asset_serves_and_caches() {
         let (server, _d) = md_server("# T").await;
 
-        let assets = [
-            ("/__mdserve/highlight.min.js", "application/javascript"),
-            ("/__mdserve/github.min.css", "text/css"),
-            ("/__mdserve/github-dark.min.css", "text/css"),
-        ];
-
-        for (path, content_type) in assets {
+        for (path, content_type) in [("/__mdserve/highlight.min.js", "application/javascript")] {
             let response = server.get(path).await;
             assert_eq!(response.status_code(), 200, "{path}");
             assert_eq!(response.header("content-type"), content_type, "{path}");

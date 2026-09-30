@@ -201,8 +201,6 @@ version 11.11.2:
 | File | Source |
 | --- | --- |
 | `static/js/highlight.min.js` | `https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.2/highlight.min.js` |
-| `static/css/github.min.css` | `https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.2/styles/github.min.css` |
-| `static/css/github-dark.min.css` | `https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.2/styles/github-dark.min.css` |
 
 To refresh them, download the same paths at the new version and update this
 table.

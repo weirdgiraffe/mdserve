@@ -44,6 +44,14 @@
             --blockquote-color: #829181;
             --link-color: #3a94c5;
             --table-header-bg: #efebd4;
+            --red: #f85552;
+            --orange: #f57d26;
+            --yellow: #dfa000;
+            --green: #8da101;
+            --aqua: #35a77c;
+            --blue: #3a94c5;
+            --purple: #df69ba;
+            --grey: #939f91;
             --content-max-width: 900px;
             --transition-speed: 0.3s;
             --transition-timing: ease;
@@ -58,6 +66,14 @@
             --blockquote-color: #9da9a0;
             --link-color: #7fbbb3;
             --table-header-bg: #3d484d;
+            --red: #e67e80;
+            --orange: #e69875;
+            --yellow: #dbbc7f;
+            --green: #a7c080;
+            --aqua: #83c092;
+            --blue: #7fbbb3;
+            --purple: #d699b6;
+            --grey: #859289;
         }
 
         /* Common body styles */
@@ -169,6 +185,19 @@
             background-color: transparent;
             padding: 0;
         }
+
+        /* highlight.js tokens, mapped as the Everforest vim syntax groups */
+        .hljs-keyword, .hljs-selector-tag, .hljs-doctag, .hljs-deletion { color: var(--red); }
+        .hljs-operator, .hljs-tag, .hljs-name, .hljs-selector-class,
+        .hljs-selector-id, .hljs-selector-pseudo, .hljs-section { color: var(--orange); }
+        .hljs-type, .hljs-built_in, .hljs-title.class_ { color: var(--yellow); }
+        .hljs-string, .hljs-regexp, .hljs-title, .hljs-addition { color: var(--green); }
+        .hljs-symbol, .hljs-variable.constant_, .hljs-template-variable { color: var(--aqua); }
+        .hljs-attr, .hljs-attribute, .hljs-variable, .hljs-property { color: var(--blue); }
+        .hljs-number, .hljs-literal, .hljs-meta, .hljs-meta .hljs-keyword { color: var(--purple); }
+        .hljs-comment, .hljs-quote { color: var(--grey); font-style: italic; }
+        .hljs-section, .hljs-strong { font-weight: bold; }
+        .hljs-emphasis { font-style: italic; }
         blockquote {
             border-left: 4px solid var(--border-color-light);
             padding-left: 16px;
@@ -215,7 +244,6 @@
     <script src="/__mdserve/mermaid.min.js"></script>
     {% endif %}
     {% if highlight_enabled %}
-    <link id="hljs-theme" rel="stylesheet" href="/__mdserve/github.min.css">
     <script src="/__mdserve/highlight.min.js"></script>
     {% endif %}
     <script>
@@ -236,7 +264,6 @@
         function onThemeChange() {
             updateThemeButton();
             updateMermaidTheme();
-            updateHighlightTheme();
         }
 
         function toggleThemeMenu() {
@@ -260,10 +287,6 @@
 
         function getMermaidTheme() {
             return isDarkTheme() ? 'dark' : 'default';
-        }
-
-        function getHighlightStylesheet() {
-            return isDarkTheme() ? '/__mdserve/github-dark.min.css' : '/__mdserve/github.min.css';
         }
 
         function initMermaid() {
@@ -341,17 +364,8 @@
             }
         }
 
-        function updateHighlightTheme() {
-            const link = document.getElementById('hljs-theme');
-            if (link) {
-                link.setAttribute('href', getHighlightStylesheet());
-            }
-        }
-
         function initHighlight() {
             if (typeof hljs !== 'undefined') {
-                updateHighlightTheme();
-
                 // Mermaid blocks are diagrams, not code, and initMermaid()
                 // already replaced them. Painting one would race that replace.
                 const codeBlocks = document.querySelectorAll('pre code[class*="language-"]');
